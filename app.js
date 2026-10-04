@@ -1,0 +1,2713 @@
+/* ===================== Figure rig: every demonstration is drawn in code ===================== */
+const SVGNS = 'http://www.w3.org/2000/svg';
+const G = 205;                                              // ground line; stage is 320 x 230
+const B = { torso: 48, neck: 24, ua: 27, fa: 25, th: 40, sn: 38, ft: 13 };
+const rad = d => d * Math.PI / 180;
+const lerp = (a, b, t) => a + (b - a) * t;
+const lp = (p, q, t) => [lerp(p[0], q[0], t), lerp(p[1], q[1], t)];
+const add = (p, q) => [p[0] + q[0], p[1] + q[1]];
+// polar from "down": 0 = down, 90 = forward (+x), 180 = up, 270 = back
+const pol = (p, deg, len) => [p[0] + Math.sin(rad(deg)) * len, p[1] + Math.cos(rad(deg)) * len];
+const clamp01 = t => Math.max(0, Math.min(1, t));
+const easeIO = t => 0.5 - 0.5 * Math.cos(Math.PI * clamp01(t));
+const pulse = c => 0.5 - 0.5 * Math.cos(c * 2 * Math.PI);  // 0 -> 1 -> 0 over one loop
+// piecewise-linear keyframes: keys = [[t0, v0], [t1, v1], ...] where v is a number or a point
+function keys(t, ks) {
+  if (t <= ks[0][0]) return ks[0][1];
+  for (let i = 1; i < ks.length; i++) {
+    if (t <= ks[i][0]) {
+      const k = easeIO((t - ks[i - 1][0]) / (ks[i][0] - ks[i - 1][0])), a = ks[i - 1][1], b = ks[i][1];
+      return Array.isArray(a) ? lp(a, b, k) : lerp(a, b, k);
+    }
+  }
+  return ks[ks.length - 1][1];
+}
+function ik(root, target, l1, l2, hint) {
+  const dx = target[0] - root[0], dy = target[1] - root[1], d = Math.hypot(dx, dy) || 0.001;
+  const dd = Math.max(Math.abs(l1 - l2) + 0.05, Math.min(l1 + l2 - 0.05, d)), ux = dx / d, uy = dy / d;
+  const a = (l1 * l1 - l2 * l2 + dd * dd) / (2 * dd), h = Math.sqrt(Math.max(0, l1 * l1 - a * a));
+  let px = -uy, py = ux;
+  if (px * hint[0] + py * hint[1] < 0) { px = -px; py = -py; }
+  return { mid: [root[0] + ux * a + px * h, root[1] + uy * a + py * h], end: [root[0] + ux * dd, root[1] + uy * dd] };
+}
+
+/* ---- side-view figure builder ----
+   hip, lean (torso lean from vertical, + = toward +x), headLean
+   arms: nH/fH = hand target (+ aHint), or nA/fA = [upperArmAngle, forearmAngle], or nArm/fArm = explicit points after the shoulder
+   legs: nF/fF = ankle target (+ lHint), or nL/fL = [thighAngle, shinAngle]; nToe/fToe override the toe point            */
+function fig(o) {
+  const far = o.far || [5, -1], hip = o.hip, lean = o.lean || 0;
+  const sh = o.sh || pol(hip, 180 - lean, B.torso);
+  const hl = o.headLean !== undefined ? o.headLean : (Math.abs(lean) <= 55 ? lean * 0.5 : lean);
+  const head = o.head || pol(sh, 180 - hl, B.neck);
+  const fsh = add(sh, far), fhip = add(hip, far);
+  const armOf = (s, H, A, pts, hint) => {
+    if (pts) return [s].concat(pts);
+    if (A) { const e = pol(s, A[0], B.ua); return [s, e, pol(e, A[1], B.fa)]; }
+    const r = ik(s, H, B.ua, B.fa, hint || [0, 1]); return [s, r.mid, r.end];
+  };
+  const legOf = (h, F, L, toe, hint) => {
+    if (L) { const k = pol(h, L[0], B.th), an = pol(k, L[1], B.sn); return [h, k, an, toe || pol(an, L[1] + (L[2] === undefined ? 90 : L[2]), B.ft)]; }
+    const r = ik(h, F, B.th, B.sn, hint || [1, 0]); return [h, r.mid, r.end, toe || [r.end[0] + B.ft, r.end[1]]];
+  };
+  const nArm = armOf(sh, o.nH, o.nA, o.nArm, o.aHint);
+  const fArm = (o.fH || o.fA || o.fArm) ? armOf(fsh, o.fH, o.fA, o.fArm, o.fHint || o.aHint)
+    : armOf(fsh, o.nH && add(o.nH, far), o.nA, o.nArm && o.nArm.map(p => add(p, far)), o.aHint);
+  const nLeg = legOf(hip, o.nF, o.nL, o.nToe, o.lHint);
+  const fLeg = (o.fF || o.fL) ? legOf(fhip, o.fF, o.fL, o.fToe, o.fLHint || o.lHint)
+    : legOf(fhip, o.nF && add(o.nF, o.fOff || [9, 0]), o.nL, o.nToe && add(o.nToe, o.fOff || [9, 0]), o.lHint);
+  return { head, sh, hip, nArm, fArm, nLeg, fLeg, bend: o.bend || 0, items: [] };
+}
+const hand = (P, far) => (far ? P.fArm : P.nArm)[(far ? P.fArm : P.nArm).length - 1];
+
+/* ---- front-view figure builder ----
+   cx, dy (whole-body shift), shY/hipY, hL/hR hands (+ hint) or straight-arm angles aL/aR (0 = down, 90 = out to the side), feet */
+function front(o) {
+  const cx = o.cx === undefined ? 160 : o.cx, dy = o.dy || 0, tilt = o.tilt || 0;
+  const hipY = (o.hipY || 124) + dy, shY = (o.shY || 78) + dy, sw = o.sw || 19, hw = 10;
+  const hc = [cx + (o.hipX || 0), hipY], sc = o.sc || [hc[0] + Math.sin(rad(tilt)) * (hipY - shY), hipY - Math.cos(rad(tilt)) * (hipY - shY)];
+  const ax = [Math.cos(rad(tilt)), Math.sin(rad(tilt))];
+  const shL = [sc[0] - ax[0] * sw, sc[1] - ax[1] * sw], shR = [sc[0] + ax[0] * sw, sc[1] + ax[1] * sw];
+  const hipL = [hc[0] - hw, hc[1]], hipR = [hc[0] + hw, hc[1]];
+  const head = o.head || [sc[0] + Math.sin(rad(tilt)) * 28, sc[1] - Math.cos(rad(tilt)) * 28];
+  const armOf = (s, H, a, sgn, hint, pts) => {
+    if (pts) return [s].concat(pts);
+    if (a !== undefined) { const e = [s[0] + sgn * Math.sin(rad(a)) * B.ua, s[1] + Math.cos(rad(a)) * B.ua]; return [s, e, [s[0] + sgn * Math.sin(rad(a)) * 52, s[1] + Math.cos(rad(a)) * 52]]; }
+    const r = ik(s, H, B.ua, B.fa, hint || [sgn, 0.6]); return [s, r.mid, r.end];
+  };
+  const fL = o.fL || [cx - 14, 199 + dy], fR = o.fR || [cx + 14, 199 + dy];
+  const legOf = (h, f, sgn, k) => [h, k || add(lp(h, f, 0.51), [sgn * 1.2, 0]), f, [f[0] + sgn * 8, f[1]]];
+  return {
+    head, shL, shR, hipL, hipR,
+    armL: armOf(shL, o.hL, o.aL, -1, o.hintL, o.armL), armR: armOf(shR, o.hR, o.aR, 1, o.hintR, o.armR),
+    legL: o.legL || legOf(hipL, fL, -1, o.kL), legR: o.legR || legOf(hipR, fR, 1, o.kR), items: []
+  };
+}
+
+/* ---- equipment a pose can carry ---- */
+const plate = (p, back) => ({ k: 'plate', p, back });
+const dbell = (p, back) => ({ k: 'db', p, back });
+const kbell = (p, back) => ({ k: 'kb', p, back });
+const mball = (p, r, back) => ({ k: 'ball', p, r: r || 10, back });
+const line = (cls, pts, back) => ({ k: 'line', cls, pts, back });
+const band = (a, b, back) => line('fg-band', [a, b], back);
+const cable = (a, b, back) => line('fg-cable', [a, b], back);
+// a load held in the hands, side view: the far hand's weight sits behind the body
+function held(P, load, opt) {
+  const nh = hand(P), fh = hand(P, 1), o = opt || {};
+  if (load === 'bb') return [plate(o.at || nh)];
+  if (load === 'db') return [dbell(fh, 1), dbell(nh)];
+  if (load === 'kb') return [kbell(fh, 1), kbell(nh)];
+  if (load === 'ball') return [mball(o.at || lp(nh, fh, 0.5))];
+  return [];
+}
+// front view: a bar across both hands, or one weight per hand
+function heldFront(P, load) {
+  const l = P.armL[P.armL.length - 1], r = P.armR[P.armR.length - 1];
+  if (load === 'bb') return [{ k: 'bar', a: l, b: r }];
+  if (load === 'db') return [{ k: 'dbf', p: l }, { k: 'dbf', p: r }];
+  if (load === 'kb') return [kbell(l), kbell(r)];
+  if (load === 'ball') return [mball(lp(l, r, 0.5))];
+  return [];
+}
+
+/* ---- static props ---- */
+const PR = {
+  mat: '<rect class="fg-mat" x="44" y="205" width="190" height="6" rx="3"/>',
+  pad: '<rect class="fg-pad" x="97" y="197" width="50" height="8.5" rx="3.5"/>',
+  wall: x => '<path class="fg-prop" d="M' + x + ' 14 L' + x + ' 204"/>',
+  bench: (x1, x2, y) => '<path class="fg-prop" d="M' + x1 + ' ' + y + ' L' + x2 + ' ' + y + ' M' + (x1 + 12) + ' ' + (y + 4) + ' L' + (x1 + 12) + ' 203 M' + (x2 - 12) + ' ' + (y + 4) + ' L' + (x2 - 12) + ' 203"/>',
+  box: (x, w, h) => '<rect class="fg-box" x="' + x + '" y="' + (G - h) + '" width="' + w + '" height="' + h + '" rx="3"/>',
+  post: (x, y) => '<path class="fg-prop" d="M' + x + ' ' + y + ' L' + x + ' 204"/>',
+  pulley: (x, y) => '<circle class="fg-anchor" cx="' + x + '" cy="' + y + '" r="4.5"/>',
+  seg: (x1, y1, x2, y2) => '<path class="fg-prop" d="M' + x1 + ' ' + y1 + ' L' + x2 + ' ' + y2 + '"/>'
+};
+
+const ANIMS = {};
+const FLOOR_BOX = '26 62 244 156';                          // closer framing for moves done lying or kneeling
+function A(id, def) { def.id = id; ANIMS[id] = def; }
+
+/* ===================== Stage: builds the SVG once per exercise, then only moves points ===================== */
+function svgEl(tag, attrs, parent) {
+  const e = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+const f1 = n => n.toFixed(1);
+const ptsStr = a => a.map(p => f1(p[0]) + ',' + f1(p[1])).join(' ');
+
+class Stage {
+  constructor(svg, tight) {
+    this.svg = svg; this.key = ''; this.tight = !!tight;
+    svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+  }
+  set(id, opts) {
+    opts = opts || {};
+    const key = id + JSON.stringify(opts);
+    if (key === this.key) return;
+    this.key = key; this.id = id; this.opts = opts;
+    const D = this.A = ANIMS[id], svg = this.svg;
+    const box = typeof D.box === 'function' ? D.box(opts) : D.box;
+    const fl = typeof D.floor === 'function' ? D.floor(opts) : D.floor;
+    svg.setAttribute('viewBox', box || (fl ? FLOOR_BOX : this.tight ? '33 30 254 182' : '0 0 320 230'));
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    const root = svgEl('g', opts.mirror ? { transform: 'translate(320 0) scale(-1 1)' } : {}, svg);
+    svgEl('line', { class: 'fg-ground', x1: 8, y1: 205.75, x2: 312, y2: 205.75 }, root);
+    this.custom = null; this.e = {}; this.pool = { back: [], front: [] }; this.headTop = false;
+    if (D.view === 'custom') { this.custom = D.build(svgEl('g', {}, root)); return; }
+    const back = svgEl('g', {}, root);
+    if (D.props) back.innerHTML = D.props(opts) || '';
+    this.gBack = svgEl('g', {}, root);
+    const e = this.e, poly = (cls, w) => svgEl('polyline', { class: cls, 'stroke-width': w }, root);
+    if (D.view === 'side') {
+      e.fArm = poly('fg-far', 10); e.fLeg = poly('fg-far', 12);
+      e.torso = svgEl('path', { class: 'fg-near', 'stroke-width': 22 }, root);
+      e.head = svgEl('circle', { class: 'fg-solid-ns', r: 11 }, root);
+      e.nLegK = poly('fg-ko', 16); e.nLeg = poly('fg-near', 12);
+      e.nArmK = poly('fg-ko', 14); e.nArm = poly('fg-near', 10);
+    } else {
+      e.legL = poly('fg-near', 12); e.legR = poly('fg-near', 12);
+      e.torso = svgEl('polygon', { class: 'fg-solid', 'stroke-width': 14 }, root);
+      e.head = svgEl('circle', { class: 'fg-solid-ns', r: 11 }, root);
+      e.armLK = poly('fg-ko', 14); e.armL = poly('fg-near', 10);
+      e.armRK = poly('fg-ko', 14); e.armR = poly('fg-near', 10);
+    }
+    this.gFront = svgEl('g', {}, root);
+  }
+  draw(t, c) {
+    const D = this.A; if (!D) return;
+    if (this.custom) { this.custom(t, this.opts, c || 0); return; }
+    const P = D.pose(t, this.opts, c || 0), e = this.e, S = (el, a) => el.setAttribute('points', ptsStr(a));
+    if (D.view === 'side') {
+      S(e.fArm, P.fArm); S(e.fLeg, P.fLeg);
+      const mx = (P.sh[0] + P.hip[0]) / 2, my = (P.sh[1] + P.hip[1]) / 2, dx = P.hip[0] - P.sh[0], dy = P.hip[1] - P.sh[1], n = Math.hypot(dx, dy) || 1, b = P.bend || 0;
+      e.torso.setAttribute('d', 'M' + f1(P.sh[0]) + ' ' + f1(P.sh[1]) + ' Q' + f1(mx - dy / n * b) + ' ' + f1(my + dx / n * b) + ' ' + f1(P.hip[0]) + ' ' + f1(P.hip[1]));
+      S(e.nLegK, P.nLeg); S(e.nLeg, P.nLeg); S(e.nArmK, P.nArm); S(e.nArm, P.nArm);
+    } else {
+      S(e.legL, P.legL); S(e.legR, P.legR);
+      S(e.torso, [P.shL, P.shR, P.hipR, P.hipL]);
+      S(e.armLK, P.armL); S(e.armL, P.armL); S(e.armRK, P.armR); S(e.armR, P.armR);
+    }
+    e.head.setAttribute('cx', f1(P.head[0])); e.head.setAttribute('cy', f1(P.head[1]));
+    const top = !!P.headTop;                                  // arms that pass the head go behind it, so the head stays visible
+    if (top !== this.headTop) { this.headTop = top; e.head.parentNode.insertBefore(e.head, top ? this.gFront : (e.nLegK || e.armLK)); }
+    // equipment and marks
+    const want = { back: [], front: [] };
+    const put = (layer, tag, cls, attrs) => want[layer].push([tag, cls, attrs]);
+    (P.items || []).forEach(it => {
+      if (!it) return;
+      const L = it.back ? 'back' : 'front';
+      if (it.k === 'plate') { put(L, 'circle', 'fg-plate', { cx: f1(it.p[0]), cy: f1(it.p[1]), r: it.r || 15 }); put(L, 'circle', 'fg-gear', { cx: f1(it.p[0]), cy: f1(it.p[1]), r: 3 }); }
+      else if (it.k === 'db') put(L, 'circle', 'fg-gear', { cx: f1(it.p[0]), cy: f1(it.p[1]), r: 7 });
+      else if (it.k === 'dbf') put(L, 'line', 'fg-dbf', { x1: f1(it.p[0] - 8), y1: f1(it.p[1]), x2: f1(it.p[0] + 8), y2: f1(it.p[1]) });
+      else if (it.k === 'kb') { put(L, 'circle', 'fg-gear', { cx: f1(it.p[0]), cy: f1(it.p[1] + 11), r: 8.5 }); put(L, 'line', 'fg-cable', { x1: f1(it.p[0]), y1: f1(it.p[1]), x2: f1(it.p[0]), y2: f1(it.p[1] + 6) }); }
+      else if (it.k === 'ball') put(L, 'circle', it.cls || 'fg-gear', { cx: f1(it.p[0]), cy: f1(it.p[1]), r: it.r });
+      else if (it.k === 'ring') put(L, 'circle', it.cls || 'fg-plate', { cx: f1(it.p[0]), cy: f1(it.p[1]), r: it.r });
+      else if (it.k === 'line') put(L, 'polyline', it.cls, { points: ptsStr(it.pts) });
+      else if (it.k === 'bar') {
+        const ext = it.ext === undefined ? 20 : it.ext, a = it.a, b = it.b, d = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1, ux = (b[0] - a[0]) / d, uy = (b[1] - a[1]) / d;
+        const p = [a[0] - ux * ext, a[1] - uy * ext], q = [b[0] + ux * ext, b[1] + uy * ext];
+        put(L, 'line', 'fg-cable', { x1: f1(p[0]), y1: f1(p[1]), x2: f1(q[0]), y2: f1(q[1]) });
+        if (!it.bare) [p, q].forEach(z => put(L, 'line', 'fg-plates', { x1: f1(z[0] - uy * 11), y1: f1(z[1] + ux * 11), x2: f1(z[0] + uy * 11), y2: f1(z[1] - ux * 11) }));
+      }
+      else if (it.k === 'hl') put('front', 'polyline', 'fg-hl', { points: ptsStr(it.pts), 'stroke-width': 5, style: 'opacity:' + (it.o === undefined ? 1 : it.o).toFixed(2) });
+      else if (it.k === 'guide') put('back', 'ellipse', 'fg-guide', { cx: it.cx, cy: it.cy, rx: it.rx, ry: it.ry });
+      else if (it.k === 'dot') put('front', 'circle', 'fg-dot', { cx: f1(it.p[0]), cy: f1(it.p[1]), r: 4 });
+    });
+    for (const layer of ['back', 'front']) {
+      const pool = this.pool[layer], parent = layer === 'back' ? this.gBack : this.gFront, w = want[layer];
+      w.forEach((x, i) => {
+        let d = pool[i];
+        if (!d || d.tag !== x[0]) { if (d) d.el.remove(); d = pool[i] = { tag: x[0], el: svgEl(x[0], {}, parent) }; if (i < pool.length - 1) parent.insertBefore(d.el, pool[i + 1].el); }
+        if (d.cls !== x[1]) { d.cls = x[1]; d.el.setAttribute('class', x[1]); d.el.removeAttribute('style'); d.el.removeAttribute('stroke-width'); }
+        for (const k in x[2]) d.el.setAttribute(k, x[2][k]);
+      });
+      while (pool.length > w.length) pool.pop().el.remove();
+    }
+  }
+}
+
+/* ===================== Families drawn standing, side view ===================== */
+// point in the torso's own frame: fw = toward the chest side, up = toward the head
+const tf = (sh, lean, fw, up) => [sh[0] + Math.cos(rad(lean)) * fw + Math.sin(rad(lean)) * up, sh[1] + Math.sin(rad(lean)) * fw - Math.cos(rad(lean)) * up];
+const shOf = (hip, lean) => pol(hip, 180 - lean, B.torso);
+const CHAIR = '<path class="fg-prop" d="M110 174.5 L160 174.5 M115 178 L115 203 M155 178 L155 203 M112 173 L107 114"/>';
+const SEATED = { hip: [150, 159], nL: [88, 2], fOff: [0, 0] };          // sitting on a bench: thighs level, shins down
+const SEAT_BENCH = PR.bench(124, 180, 172);
+// a load carried through a squat-type move: returns the arm spec and the items
+function carryLoad(P0, load, sh, lean, foot) {
+  if (load === 'bbBack') { const bar = tf(sh, lean, -9, 3); return [{ nH: tf(sh, lean, 3, -3), aHint: [-0.5, 1] }, [Object.assign(plate(bar, 1), { r: 13 })]]; }
+  if (load === 'front') { const bar = tf(sh, lean, 12, 0); return [{ nH: tf(sh, lean, 14, -2), aHint: [1, 0.3] }, [Object.assign(plate(bar, 1), { r: 13 })]]; }
+  if (load === 'goblet') { const w = tf(sh, lean, 15, -14); return [{ nH: w, aHint: [0.2, 1] }, [mball(add(w, [1, 2]), 9)]]; }
+  if (load === 'dbSides') return [{ nA: [2, 5] }, 'db'];
+  if (load === 'oh') return [{ nA: [177, 181] }, 'bbHand'];
+  if (load === 'band') { const h = add(sh, [13, 3]); return [{ nH: h, aHint: [0.3, 1] }, [band(foot || [181, G - 1], h)]]; }
+  return [null, []];
+}
+function withLoad(base, load, sh, lean, dflt, foot) {
+  const r = carryLoad(null, load, sh, lean, foot), P = fig(Object.assign({}, base, r[0] || dflt));
+  P.items = r[1] === 'db' ? held(P, 'db') : r[1] === 'bbHand' ? [plate(hand(P))] : r[1];
+  return P;
+}
+
+A('squat', {
+  view: 'side', first: 'down', L: ['Lower', 'Stand'],
+  props: o => o.chair ? CHAIR : o.box ? PR.box(104, 58, 32) : '',
+  pose(t, o) {
+    const seat = o.chair || o.box, hip = lp([172, 121.5], seat ? [143, 162] : [151, 153], t);
+    const upright = o.load === 'front' || o.load === 'goblet' || o.load === 'oh' ? 0.7 : 1;
+    const lean = lerp(2, seat ? 30 : 36, Math.sin(t * Math.PI / 2)) * upright, sh = shOf(hip, lean), a = lerp(16, 84, t);
+    return withLoad({ hip, lean, nF: [176, 199], lHint: [1, -0.2] }, o.load, sh, lean, { nA: [a - 4, a + 6] });
+  }
+});
+
+const PLYO_TL = () => [{ l: 'Dip', k: 'down', d: 0.5, a: 0, b: 0.35, side: 0 }, { l: 'Jump', k: 'up', d: 0.45, a: 0.35, b: 0.75, side: 0 }, { l: 'Land', k: 'hold', d: 0.55, a: 0.75, b: 1, side: 0 }];
+A('jump', {
+  view: 'side', tl: PLYO_TL, lin: 1,
+  pose(t, o) {
+    const s = keys(t, [[0, 0], [0.35, 0.55], [0.55, 0], [0.75, o.tuck ? 0.55 : 0.08], [0.9, 0.32], [1, 0]]);
+    const h = keys(t, [[0, 0], [0.5, 0], [0.75, 28], [0.92, 0], [1, 0]]);
+    const hip = lp([172, 121.5], [151, 153], s); hip[1] -= h;
+    const lean = lerp(2, 36, s), air = h > 1, an = [176, 199 - h - (o.tuck ? 16 * clamp01(h / 30) : 0)];
+    const aa = keys(t, [[0, 10], [0.35, -40], [0.6, 135], [0.8, 110], [1, 10]]);
+    const base = { hip, lean, nF: an, lHint: [1, -0.2], nToe: air ? [an[0] + 9, an[1] + 9] : undefined };
+    if (o.load) return withLoad(base, 'bbBack', shOf(hip, lean), lean);
+    return fig(Object.assign(base, { nA: [aa, aa + 12] }));
+  }
+});
+A('boxJump', {
+  view: 'side', lin: 1,
+  tl: () => PLYO_TL().concat([{ l: 'Step down', k: 'hold', d: 1.1, a: 1, b: 0, side: 1 }]),
+  props: () => PR.box(196, 70, 38),
+  pose(t, o, c) {
+    if (c >= 0.5) {                                             // stepping back down: slide between the two standing spots
+      const hip = lp([140, 121.5], [228, 83.5], t);
+      return fig({ hip, lean: 2, nF: lp([144, 199], [232, 161], t), nA: [8, 14] });
+    }
+    const x = keys(t, [[0, 0], [0.5, 0], [0.8, 88], [1, 88]]), y = keys(t, [[0, 0], [0.5, 0], [0.66, 58], [0.8, 38], [1, 38]]);
+    const s = keys(t, [[0, 0], [0.35, 0.55], [0.5, 0], [0.66, 0.5], [0.82, 0.45], [1, 0]]);
+    const hip = lp([140, 121.5], [121, 153], s); hip[0] += x; hip[1] -= y;
+    const aa = keys(t, [[0, 10], [0.35, -40], [0.55, 150], [0.82, 70], [1, 10]]), air = t > 0.5 && t < 0.8, an = [144 + x, 199 - y];
+    return fig({ hip, lean: lerp(2, 36, s), nF: an, lHint: [1, -0.2], nToe: air ? [an[0] + 10, an[1] + 8] : undefined, nA: [aa, aa + 12] });
+  }
+});
+A('lungeJump', {
+  view: 'side', lin: 1,
+  tl: () => [{ l: 'Jump', k: 'up', d: 0.5, a: 0, b: 0.5, side: 0 }, { l: 'Land', k: 'down', d: 0.6, a: 0.5, b: 1, side: 0 }, { l: 'Jump', k: 'up', d: 0.5, a: 0, b: 0.5, side: 1 }, { l: 'Land', k: 'down', d: 0.6, a: 0.5, b: 1, side: 1 }],
+  pose(t, o, c) {
+    // t 0 = lunge with one leg forward, 0.5 = airborne feet passing, 1 = lunge with the other leg forward
+    const k = 1 - Math.abs(2 * t - 1), h = 26 * k, sw = (c >= 0.5 ? 1 - t : t);       // sw: 0 near leg forward, 1 far leg forward
+    const hip = [160, lerp(154, 126, k) - h * 0.6];
+    const fwd = [190, 199 - h], back = [124, 194 - h], nF = lp(fwd, back, sw), fF = lp(back, fwd, sw);
+    return fig({ hip, lean: 6, nF, fF, lHint: [1, 0.2], fLHint: [1, 0.2], nToe: [nF[0] + 11, nF[1] + (sw > 0.5 ? 8 : 0)], fToe: [fF[0] + 11, fF[1] + (sw > 0.5 ? 0 : 8)], nA: [lerp(-30, 40, sw), lerp(10, 110, sw)], fA: [lerp(40, -30, sw), lerp(110, 10, sw)] });
+  }
+});
+
+A('lunge', {
+  view: 'side', first: 'down', L: ['Lower', 'Rise'],
+  props: o => o.mode === 'bulgarian' ? PR.bench(70, 126, 172) : '',
+  pose(t, o) {
+    const bul = o.mode === 'bulgarian', hip = lp([160, 127], [158, 158], t), lean = lerp(4, 9, t), sh = shOf(hip, lean);
+    const base = { hip, lean, nF: [188, 199], lHint: [1, -0.3], fF: bul ? [112, 164] : [124, 194], fToe: bul ? [99, 166] : [131, 202], fLHint: [0.25, 1] };
+    const ld = (o.load === 'bb' || o.load === 'machine') ? 'bbBack' : (o.load === 'db' || o.load === 'kb') ? 'dbSides' : null;
+    return withLoad(base, ld, sh, lean, { nH: add(hip, [3, -9]), aHint: [-1, 0.1] });
+  }
+});
+A('stepUp', {
+  view: 'side', first: 'up', L: ['Step up', 'Lower'],
+  props: () => PR.box(186, 70, 32),
+  pose(t, o) {
+    const hip = lp([176, 124], [206, 90], t), lean = lerp(14, 2, t), sh = shOf(hip, lean);
+    const fF = add(lp([162, 199], [214, 167], t), [0, -10 * Math.sin(Math.PI * t)]);
+    const base = { hip, lean, nF: [204, 167], lHint: [1, -0.4], fF, fLHint: [1, 0] };
+    const ld = o.load === 'bb' ? 'bbBack' : o.load ? 'dbSides' : null, sw = lerp(-20, 20, t);
+    return withLoad(base, ld, sh, lean, { nA: [-sw, 40 - sw], fA: [sw, 40 + sw] });
+  }
+});
+
+/* ---- hip hinge: deadlifts, good mornings, pull-throughs, swings ---- */
+const DL = { conv: { hip: [140, 150], lean: 75, h: [186, 190] }, stiff: { hip: [148, 128], lean: 80, h: [191, 170] }, rack: { hip: [156, 132], lean: 50, h: [184, 152] } };
+function hinge(u, st) { const b = DL[st] || DL.conv; return { hip: lp(b.hip, [170, 122], u), lean: lerp(b.lean, 0, u), H: lp(b.h, [176, 130], u) }; }
+A('deadlift', {
+  view: 'side', first: o => (o.style === 'stiff' ? 'down' : 'up'), L: o => (o.style === 'stiff' ? ['Lower', 'Stand'] : ['Lift', 'Lower']),
+  props: o => o.load === 'cable' ? PR.pulley(238, 199) : '',
+  pose(t, o) {
+    const u = o.style === 'stiff' ? 1 - t : t, h = hinge(u, o.style);
+    const P = fig({ hip: h.hip, lean: h.lean, nF: [172, 199], lHint: [1, -0.1], nH: h.H, aHint: [-0.2, 1] });
+    P.items = o.load === 'cable' ? [cable([238, 199], hand(P))] : o.load === 'band' ? [band([180, G - 1], hand(P))] : held(P, !o.load || o.load === 'machine' ? 'bb' : o.load);
+    return P;
+  }
+});
+A('goodMorning', {
+  view: 'side', first: 'down', L: ['Hinge', 'Stand'],
+  pose(t, o) {
+    const hip = lp([168, 122], [150, 127], t), lean = lerp(0, 78, t), sh = shOf(hip, lean);
+    const P = fig({ hip, lean, nF: [170, 199], lHint: [1, -0.1], nH: tf(sh, lean, 4, -2), aHint: [-0.5, 1] });
+    P.items = o.load === 'band' ? [band([178, G - 1], tf(sh, lean, -2, 6))] : [Object.assign(plate(tf(sh, lean, -9, 3), 1), { r: 13 })];
+    return P;
+  }
+});
+A('pullThrough', {
+  view: 'side', first: 'up', L: ['Stand', 'Hinge'],
+  props: () => PR.pulley(66, 196),
+  pose(t, o) {
+    const hip = lp([150, 128], [170, 122], t), lean = lerp(68, 0, t);
+    const P = fig({ hip, lean, nF: [172, 199], lHint: [1, -0.1], nH: lp([148, 156], [172, 136], t), aHint: [0.4, 1] });
+    P.items = [line(o.load === 'band' ? 'fg-band' : 'fg-cable', [[66, 196], hand(P)], 1)];
+    return P;
+  }
+});
+A('swing', {
+  view: 'side', first: 'up', L: ['Swing', 'Back'], tempo: [1, 1],
+  pose(t) {
+    const hip = lp([150, 130], [170, 122], t), lean = lerp(62, -4, t), sh = shOf(hip, lean), a = lerp(-28, 96, t);
+    const P = fig({ hip, lean, nF: [172, 199], lHint: [1, -0.1], nA: [a, a + 4] }), h = hand(P);
+    P.items = [mball(pol(h, a + 4, 11), 8.5)];
+    return P;
+  }
+});
+A('nordic', {
+  view: 'side', floor: true, first: 'down', L: ['Lower', 'Pull back'],
+  props: () => PR.pad + '<path class="fg-prop" d="M70 186 L96 186 M83 186 L83 204"/>',
+  pose(t) {
+    const kn = [122, 191], a = lerp(4, 56, t), hip = pol(kn, 180 - a, B.th), sh = pol(hip, 180 - a - 3 * t, B.torso);
+    const P = fig({ sh, hip, head: pol(sh, 180 - a + 6, B.neck), far: [3, -3], nH: lp([sh[0] + 13, sh[1] + 22], [sh[0] + 20, Math.min(197, sh[1] + 44)], t), aHint: [-0.3, 1], nF: [84, 198.5] });
+    P.nLeg = [hip, kn, [84, 198.5], [72, 199.5]]; P.fLeg = [add(hip, [3, -3]), add(kn, [5, -1]), [88, 194], [77, 192]];
+    return P;
+  }
+});
+A('calfRaise', {
+  view: 'side', first: 'up', L: ['Rise', 'Lower'],
+  props: o => o.seated ? SEAT_BENCH : '<rect class="fg-box" x="160" y="199" width="34" height="6" rx="2"/>',
+  pose(t, o) {
+    const r = 9 * t;
+    if (o.seated) {
+      const kn = [190, 160.5 - r * 0.85], an = [189, 199 - r], P = fig({ hip: [150, 159], lean: 4, nLegX: 1, nF: an, nToe: [202, 199], lHint: [1, -1], nH: add(kn, [-8, -9]), aHint: [-1, 0.3], fOff: [0, 0] });
+      P.items = [mball(add(kn, [-4, -13]), 8)];
+      return P;
+    }
+    const hip = [168, 122 - r], lean = 2, sh = shOf(hip, lean);
+    const ld = o.load === 'bb' || o.load === 'machine' ? 'bbBack' : o.load === 'db' ? 'dbSides' : null;
+    return withLoad({ hip, lean, nF: [170, 199 - r], nToe: [183, 199], lHint: [1, 0] }, ld, sh, lean, { nA: [4, 10] });
+  }
+});
+
+/* ---- arms ---- */
+A('curl', {
+  view: 'side', first: 'up', L: ['Curl', 'Lower'],
+  props: o => (o.pos && o.pos !== 'stand' ? SEAT_BENCH : '') + (o.pos === 'preacher' ? PR.seg(176, 150, 196, 120) + PR.seg(186, 136, 190, 203) : '') +
+    (o.pos === 'incline' ? PR.seg(128, 172, 96, 112) : '') + (o.load === 'cable' ? PR.pulley(240, 199) : ''),
+  pose(t, o) {
+    const pos = o.pos || 'stand'; let base, a1 = 3, a2 = lerp(8, 148, t);
+    if (pos === 'stand') base = { hip: [160, 122], lean: -1, nF: [160, 199] };
+    else if (pos === 'seat') base = Object.assign({ lean: -2 }, SEATED);
+    else if (pos === 'incline') { base = Object.assign({ lean: -30 }, SEATED); a1 = 0; a2 = lerp(4, 140, t); }
+    else if (pos === 'preacher') { base = Object.assign({ lean: 16 }, SEATED); a1 = 44; a2 = lerp(48, 162, t); }
+    else { base = Object.assign({ lean: 40 }, SEATED); a1 = -6; a2 = lerp(-2, 126, t); }
+    const P = fig(Object.assign({ nA: [a1, a2] }, base));
+    P.items = o.load === 'cable' ? [cable([240, 199], hand(P))] : o.load === 'band' ? [band([P.nLeg[2][0] + 8, G - 1], hand(P))] : held(P, o.load === 'machine' ? 'bb' : (o.load || 'db'));
+    return P;
+  }
+});
+A('frontRaise', {
+  view: 'side', first: 'up', L: ['Raise', 'Lower'],
+  props: o => o.load === 'cable' ? PR.pulley(98, 199) : '',
+  pose(t, o) {
+    const a = lerp(6, 90, t), P = fig({ hip: [160, 122], lean: -2, nF: [160, 199], nA: [a, a + 4] });
+    P.items = o.load === 'cable' ? [cable([98, 199], hand(P), 1)] : o.load === 'band' ? [band([168, G - 1], hand(P))] : held(P, o.load || 'db');
+    return P;
+  }
+});
+A('pushdown', {
+  view: 'side', first: 'up', L: ['Push down', 'Return'],
+  props: () => PR.post(236, 26) + PR.seg(236, 28, 214, 28) + PR.pulley(214, 30),
+  pose(t, o) {
+    const P = fig({ hip: [158, 123], lean: 9, nF: [160, 199], nA: [8, lerp(124, 12, t)] });
+    P.items = [line(o && o.load === 'band' ? 'fg-band' : 'fg-cable', [[214, 30], hand(P)])];
+    return P;
+  }
+});
+A('overTri', {
+  view: 'side', first: 'up', L: ['Extend', 'Lower'],
+  props: o => (o.seat ? SEAT_BENCH : '') + (o.load === 'cable' ? PR.pulley(98, 199) : ''),
+  pose(t, o) {
+    const base = o.seat ? Object.assign({ lean: -1 }, SEATED) : { hip: [160, 122], lean: 0, nF: [160, 199] };
+    const P = fig(Object.assign({ nA: [177, lerp(318, 184, t)] }, base));
+    P.items = o.load === 'cable' ? [cable([98, 199], hand(P), 1)] : o.load === 'band' ? [band([P.nLeg[2][0], G - 1], hand(P), 1)] : held(P, o.load === 'bb' ? 'bb' : 'db').slice(-1);
+    P.headTop = true;
+    return P;
+  }
+});
+A('triKickback', {
+  view: 'side', first: 'up', L: ['Extend', 'Return'],
+  pose(t) {
+    const P = fig({ hip: [150, 128], lean: 66, nF: [164, 199], lHint: [1, -0.2], nA: [284, lerp(356, 284, t)], fH: [182, 162], fHint: [1, 0.3] });
+    P.items = [dbell(hand(P))];
+    return P;
+  }
+});
+
+/* ---- pulls ---- */
+A('bentRow', {
+  view: 'side', first: 'up', L: ['Pull', 'Lower'],
+  props: o => (o.one ? PR.bench(182, 262, 164) : '') + (o.bench ? PR.seg(150, 168, 214, 98) + PR.seg(182, 134, 182, 203) : '') + (o.load === 'cable' ? PR.pulley(250, 199) : ''),
+  pose(t, o) {
+    const hip = [146, 128], lean = 62, sh = shOf(hip, lean);
+    const o2 = { hip, lean, nF: [160, 199], lHint: [1, -0.2], nH: lp([sh[0], sh[1] + 50], [sh[0] - 13, sh[1] + 21], t), aHint: [-1, -0.4] };
+    if (o.one) { o2.fH = [200, 159]; o2.fHint = [-0.2, 1]; }
+    const P = fig(o2);
+    P.items = o.load === 'cable' ? [cable([250, 199], hand(P))] : o.load === 'band' ? [band([168, G - 1], hand(P))]
+      : o.one ? [dbell(hand(P))] : held(P, o.load === 'machine' ? 'bb' : (o.load || 'bb'));
+    return P;
+  }
+});
+A('row', {
+  view: 'side', first: 'up', L: ['Pull', 'Return slowly'],
+  props: () => '<path class="fg-prop" d="M294 26 L294 204"/><circle class="fg-anchor" cx="291" cy="88" r="5"/>',
+  pose(t, o) {
+    const hip = [150, 123], lean = lerp(-2, -6, t), sh = shOf(hip, lean);
+    const P = fig({ hip, lean, head: [sh[0] + 1, sh[1] - B.neck], nH: lp([sh[0] + 50, 88], [sh[0] + 8, 96], t), aHint: [-1, 0.35], nF: [143, 199], fF: [161, 199] });
+    P.items = [line(o.load === 'cable' ? 'fg-cable' : 'fg-band', [[289, 88], hand(P)])];
+    return P;
+  }
+});
+A('facePull', {
+  view: 'side', first: 'up', L: ['Pull', 'Return'],
+  props: () => '<path class="fg-prop" d="M294 26 L294 204"/><circle class="fg-anchor" cx="291" cy="62" r="5"/>',
+  pose(t, o) {
+    const hip = [150, 123], lean = lerp(-3, -8, t), sh = shOf(hip, lean);
+    const P = fig({ hip, lean, head: [sh[0] + 1, sh[1] - B.neck], nH: lp([sh[0] + 50, sh[1] - 6], [sh[0] + 17, sh[1] - 16], t), aHint: [-0.5, -1], nF: [143, 199], fF: [161, 199] });
+    P.items = [line(o.load === 'band' ? 'fg-band' : 'fg-cable', [[289, 62], hand(P)])];
+    P.headTop = true;
+    return P;
+  }
+});
+A('armPulldown', {
+  view: 'side', first: 'up', L: ['Pull down', 'Return'],
+  props: () => PR.post(246, 22) + PR.seg(246, 24, 224, 24) + PR.pulley(224, 26),
+  pose(t) {
+    const a = lerp(132, 16, t), P = fig({ hip: [150, 124], lean: 14, nF: [154, 199], lHint: [1, -0.2], nA: [a, a + 5] });
+    P.items = [cable([224, 26], hand(P))];
+    return P;
+  }
+});
+A('standPress', {
+  view: 'side', first: 'up', L: ['Press', 'Return'],
+  props: () => PR.post(40, 60) + PR.pulley(42, 96),
+  pose(t, o) {
+    const hip = [150, 123], lean = 6, sh = shOf(hip, lean);
+    const P = fig({ hip, lean, nH: lp([sh[0] + 13, sh[1] + 15], [sh[0] + 50, sh[1] + 12], t), aHint: [-0.4, 1], nF: [164, 199], fF: [138, 199] });
+    P.items = [line(o.load === 'band' ? 'fg-band' : 'fg-cable', [[42, 96], hand(P)], 1)];
+    return P;
+  }
+});
+A('chestPass', {
+  view: 'side', first: 'up', L: ['Push', 'Catch'], tempo: [1, 1],
+  pose(t) {
+    const hip = [150, 123], lean = lerp(2, 10, t), sh = shOf(hip, lean);
+    const P = fig({ hip, lean, nH: lp([sh[0] + 14, sh[1] + 14], [sh[0] + 50, sh[1] + 8], t), aHint: [-0.4, 1], nF: [164, 199], fF: [138, 199] });
+    P.items = [mball(add(hand(P), [9, 0]), 10)];
+    return P;
+  }
+});
+A('ballSlam', {
+  view: 'side', first: 'up', L: ['Slam', 'Lift'], tempo: [1.4, 0.6],
+  pose(t) {
+    const hip = lp([170, 121], [154, 132], t), lean = lerp(-3, 54, t), a = lerp(176, 30, t);
+    const P = fig({ hip, lean, nF: [172, 199], lHint: [1, -0.1], nA: [a, a + 6] });
+    P.items = [mball(pol(hand(P), a + 6, 9), 10)];
+    return P;
+  }
+});
+
+/* ---- weightlifting movements, in broad strokes ---- */
+function liftPose(t, K) {                                    // K: keyframes of {hip, lean, H, hint, r (heel rise), split}
+  const g = f => keys(t, K.map(k => [k.t, f(k)]));
+  const hip = g(k => k.hip), lean = g(k => k.lean), H = g(k => k.H), hint = g(k => k.hint), r = g(k => k.r || 0), sp = g(k => k.split || 0);
+  const P = fig({ hip, lean, nH: H, aHint: hint, nF: [172 + 18 * sp, 199 - r], nToe: [185 + 18 * sp, 199], fF: [181 - 40 * sp, 199 - r - 4 * sp], fToe: [194 - 40 * sp, 199], lHint: [1, -0.1], fLHint: [1, 0.3] });
+  P.headTop = true;
+  return P;
+}
+const rackAt = (hip, lean) => tf(shOf(hip, lean), lean, 13, 0);
+const overAt = (hip, lean) => add(shOf(hip, lean), [1, -51]);
+const loadItems = (P, o) => (o.load === 'kb' || o.load === 'db' ? held(P, o.load) : [plate(hand(P))]);
+const CLEAN_TL = [{ l: 'Pull', k: 'up', d: 1.0, a: 0, b: 0.75, side: 0 }, { l: 'Stand', k: 'up', d: 0.7, a: 0.75, b: 1, side: 0 }];
+A('clean', {
+  view: 'side', lin: 1,
+  tl: (D, U, o) => (o && o.jerk)
+    ? CLEAN_TL.concat([{ l: 'Dip', k: 'down', d: 0.5, a: 0, b: 0.3, side: 1 }, { l: 'Drive', k: 'up', d: 0.5, a: 0.3, b: 0.65, side: 1 }, { l: 'Stand', k: 'hold', d: 0.7, a: 0.65, b: 1, side: 1 },
+      { l: 'Lower', k: 'down', d: 0.9, a: 0, b: 1, side: 2 }, { l: 'Lower', k: 'down', d: 1.3, a: 1, b: 0, side: 0 }])
+    : CLEAN_TL.concat([{ l: 'Lower', k: 'down', d: 1.5, a: 1, b: 0, side: 0 }]),
+  pose(t, o, c) {
+    if (c >= 1.5) {                                           // from overhead back to the shoulders
+      const P = liftPose(t, [{ t: 0, hip: [170, 122], lean: 0, H: overAt([170, 122], 0), hint: [1, 0] }, { t: 1, hip: [170, 122], lean: 0, H: rackAt([170, 122], 0), hint: [1, 0.3] }]);
+      P.items = loadItems(P, o); return P;
+    }
+    if (c >= 0.5) return ANIMS.jerk.pose(t, o, 0);
+    const b = o.hang ? DL.rack : DL.conv;
+    const P = liftPose(t, [{ t: 0, hip: b.hip, lean: b.lean, H: b.h, hint: [-0.2, 1] }, { t: 0.45, hip: [170, 116], lean: -6, H: [179, 124], hint: [-0.6, 0.6], r: 6 },
+      { t: 0.75, hip: [160, 138], lean: 8, H: rackAt([160, 138], 8), hint: [1, 0.3] }, { t: 1, hip: [170, 122], lean: 0, H: rackAt([170, 122], 0), hint: [1, 0.3] }]);
+    P.items = loadItems(P, o); return P;
+  }
+});
+A('snatch', {
+  view: 'side', lin: 1, tl: () => [{ l: 'Pull', k: 'up', d: 1.0, a: 0, b: 0.75, side: 0 }, { l: 'Stand', k: 'up', d: 0.8, a: 0.75, b: 1, side: 0 }, { l: 'Lower', k: 'down', d: 1.5, a: 1, b: 0, side: 0 }],
+  pose(t, o) {
+    const b = o.hang ? DL.rack : DL.conv;
+    const P = liftPose(t, [{ t: 0, hip: b.hip, lean: b.lean, H: b.h, hint: [-0.2, 1] }, { t: 0.45, hip: [170, 116], lean: -6, H: [180, 112], hint: [-0.8, 0.2], r: 6 },
+      { t: 0.75, hip: [152, 150], lean: 20, H: overAt([152, 150], 20), hint: [-1, 0] }, { t: 1, hip: [170, 122], lean: 0, H: overAt([170, 122], 0), hint: [-1, 0] }]);
+    P.items = loadItems(P, o); return P;
+  }
+});
+A('jerk', {
+  view: 'side', lin: 1, tl: () => [{ l: 'Dip', k: 'down', d: 0.5, a: 0, b: 0.3, side: 0 }, { l: 'Drive', k: 'up', d: 0.5, a: 0.3, b: 0.65, side: 0 }, { l: 'Stand', k: 'hold', d: 0.7, a: 0.65, b: 1, side: 0 }, { l: 'Lower', k: 'down', d: 1.3, a: 1, b: 0, side: 0 }],
+  pose(t, o) {
+    const P = liftPose(t, [{ t: 0, hip: [170, 122], lean: 0, H: rackAt([170, 122], 0), hint: [1, 0.3] }, { t: 0.3, hip: [164, 135], lean: 4, H: rackAt([164, 135], 4), hint: [1, 0.3] },
+      { t: 0.65, hip: [168, 132], lean: 0, H: overAt([168, 132], 0), hint: [1, 0], split: 1 }, { t: 1, hip: [170, 122], lean: 0, H: overAt([170, 122], 0), hint: [1, 0] }]);
+    P.items = loadItems(P, o); return P;
+  }
+});
+A('highPull', {
+  view: 'side', first: 'up', L: ['Pull', 'Lower'],
+  pose(t, o) {
+    const P = liftPose(t, [{ t: 0, hip: DL.conv.hip, lean: DL.conv.lean, H: DL.conv.h, hint: [-0.2, 1] }, { t: 0.6, hip: [170, 118], lean: -4, H: [178, 124], hint: [-0.6, 0.4], r: 4 },
+      { t: 1, hip: [170, 114], lean: -6, H: [178, 82], hint: [-0.5, -1], r: 8 }]);
+    P.items = loadItems(P, o); return P;
+  }
+});
+
+/* ---- walking, running, carrying ---- */
+function gait(c, run) {
+  const s = Math.sin(c * 2 * Math.PI), ln = Math.max(0, s), lf = Math.max(0, -s);
+  if (!run) {
+    const hip = [158, 123 - 1.2 * Math.abs(s)], nan = lp([156, 199], [171, 171], ln), fan = lp([164, 199], [179, 171], lf);
+    return { hip, lean: 2, s, nF: nan, fF: fan, nToe: [nan[0] + 12.5, nan[1] + 4 * ln], fToe: [fan[0] + 12.5, fan[1] + 4 * lf] };
+  }
+  const foot = ph => { const a = (ph % 1) * 2 * Math.PI; return a < Math.PI ? [182 - 44 * (a / Math.PI), 199] : [138 + 22 * (1 - Math.cos(a - Math.PI)), 199 - 34 * Math.sin(a - Math.PI)]; };
+  const n = foot(c), f = foot(c + 0.5), up = p => (p[1] < 198 ? 6 : 0);
+  return { hip: [160, 125 - 3 * Math.abs(Math.cos(c * 2 * Math.PI))], lean: 10, s: Math.cos(c * 2 * Math.PI), nF: n, fF: f, nToe: [n[0] + 12, n[1] + up(n)], fToe: [f[0] + 12, f[1] + up(f)] };
+}
+function gaitFig(c, run, arms) {
+  const g = gait(c, run), sw = (k, amp, el) => [amp * k, amp * k + el];
+  return fig({ hip: g.hip, lean: g.lean, nF: g.nF, fF: g.fF, nToe: g.nToe, fToe: g.fToe, lHint: [1, 0], nA: arms ? [2, 6] : sw(-g.s, run ? 40 : 24, run ? 85 : 62), fA: arms ? [2, 6] : sw(g.s, run ? 40 : 24, run ? 85 : 62) });
+}
+A('walk', { view: 'side', loop: 1.05, pose: (t, o, c) => gaitFig(c, false) });
+A('run', { view: 'side', loop: 0.72, pose: (t, o, c) => gaitFig(c, true) });
+A('carry', { view: 'side', loop: 1.2, pose(t, o, c) { const P = gaitFig(c, false, true); P.items = [mball(add(hand(P, 1), [0, 9]), 9, 1), mball(add(hand(P), [0, 9]), 9)]; return P; } });
+A('jumpRope', {
+  view: 'side', loop: 0.6,
+  pose(t, o, c) {
+    const h = 9 * Math.max(0, Math.sin((c - 0.3) * 2 * Math.PI)), hip = [162, 123 - h];
+    const P = fig({ hip, lean: 2, nF: [164, 199 - h], nToe: [176, 199 - h * 0.3 + (h > 1 ? 4 : 0)], nA: [10, 58] }), hd = hand(P), a = c * 2 * Math.PI;
+    const far = [hd[0] - 30 + 96 * Math.sin(a) * 0.55, hd[1] - 12 - 88 * Math.cos(a)];
+    const dx = far[0] - hd[0], dy = far[1] - hd[1], n = Math.hypot(dx, dy) || 1, bow = 13, q = [(hd[0] + far[0]) / 2 - dy / n * bow, (hd[1] + far[1]) / 2 + dx / n * bow];
+    const pts = []; for (let i = 0; i <= 8; i++) { const u = i / 8; pts.push([(1 - u) * (1 - u) * hd[0] + 2 * u * (1 - u) * q[0] + u * u * far[0], (1 - u) * (1 - u) * hd[1] + 2 * u * (1 - u) * q[1] + u * u * far[1]]); }
+    P.items = [line('fg-cable', pts, Math.cos(a) > 0 ? 1 : 0)];
+    return P;
+  }
+});
+
+/* ---- leg swings and standing kickbacks ---- */
+A('legSwing', {
+  view: 'side', first: 'up', L: ['Lift', 'Lower'],
+  props: o => PR.post(216, 96) + (o.load === 'cable' ? PR.pulley(o.dir === 'back' ? 216 : 96, 199) : ''),
+  pose(t, o) {
+    const back = o.dir === 'back', a = back ? lerp(-4, -40, t) : lerp(4, 62, t);
+    const P = fig({ hip: [166, 122], lean: back ? lerp(2, 12, t) : -2, fF: [168, 199], nL: [a, a - 3], fH: [213, 112], fHint: [0, 1], nH: [170, 112], aHint: [-1, 0.2] });
+    const an = P.nLeg[2];
+    P.items = o.load === 'cable' ? [cable([back ? 216 : 96, 199], an)] : o.load === 'band' ? [band(P.fLeg[2], an)] : [];
+    return P;
+  }
+});
+
+/* ===================== Families drawn from the front ===================== */
+const CX = 160;
+const FSIT = { hipY: 150, shY: 104, kL: [CX - 15, 160], kR: [CX + 15, 160], fL: [CX - 17, 199], fR: [CX + 17, 199] };   // sitting, seen from the front
+const FBENCH = '<path class="fg-prop" d="M116 160 L204 160 M126 164 L126 203 M194 164 L194 203"/>';
+const lastPt = a => a[a.length - 1];
+function frontLoad(P, o, feet) {
+  const l = lastPt(P.armL), r = lastPt(P.armR), fl = feet || [[CX - 19, G - 1], [CX + 19, G - 1]];
+  if (o.load === 'band') return [band(fl[0], l), band(fl[1], r)];
+  if (o.load === 'cable') return [cable([CX - 60, 199], l, 1), cable([CX + 60, 199], r, 1)];
+  return heldFront(P, o.load === 'machine' ? 'bb' : (o.load || 'db'));
+}
+
+A('ohPress', {
+  view: 'front', first: 'up', L: ['Press', 'Lower'],
+  props: o => (o.seat ? FBENCH : '') + (o.load === 'cable' ? PR.pulley(CX - 60, 199) + PR.pulley(CX + 60, 199) : ''),
+  pose(t, o) {
+    const s = o.seat ? FSIT : {}, y = s.shY || 78;
+    const P = front(Object.assign({ hL: lp([CX - 36, y - 9], [CX - 23, y - 51.5], t), hR: lp([CX + 36, y - 9], [CX + 23, y - 51.5], t), hintL: [-1, 0.7], hintR: [1, 0.7] }, s));
+    P.items = frontLoad(P, o);
+    return P;
+  }
+});
+A('lateralRaise', {
+  view: 'front', first: 'up', L: ['Raise', 'Lower'],
+  props: o => (o.load === 'cable' ? PR.pulley(CX - 60, 199) + PR.pulley(CX + 60, 199) : ''),
+  pose(t, o) { const a = lerp(8, 88, t), P = front({ aL: a, aR: a }); P.items = frontLoad(P, o); return P; }
+});
+A('uprightRow', {
+  view: 'front', first: 'up', L: ['Pull up', 'Lower'],
+  pose(t, o) {
+    const y = lerp(134, 90, t), P = front({ hL: [CX - 10, y], hR: [CX + 10, y], hintL: [-1, -0.5], hintR: [1, -0.5] });
+    const l = lastPt(P.armL), r = lastPt(P.armR);
+    P.items = o.load === 'band' ? [band([CX, G - 1], lp(l, r, 0.5))] : o.load === 'cable' ? [cable([CX, 199], lp(l, r, 0.5))] : o.load === 'db' || o.load === 'kb' ? heldFront(P, o.load) : [{ k: 'bar', a: l, b: r, ext: 30 }];
+    return P;
+  }
+});
+A('shrug', {
+  view: 'front', first: 'up', L: ['Shrug', 'Lower'],
+  pose(t, o) {
+    const r = 8 * t, P = front({ shY: 78 - r, head: [CX, 50 - r * 0.45], aL: 7, aR: 7 });
+    P.items = o.load === 'bb' ? [{ k: 'bar', a: add(lastPt(P.armL), [6, 0]), b: add(lastPt(P.armR), [-6, 0]), ext: 34 }] : o.load ? heldFront(P, o.load === 'cable' ? 'db' : o.load) : [];
+    return P;
+  }
+});
+A('reverseFly', {
+  view: 'front', first: 'up', L: ['Open', 'Lower'],
+  props: o => (o.seat ? FBENCH : ''),
+  pose(t, o) {
+    if (o.seat) {
+      const P = front(Object.assign({ hL: lp([CX - 12, 108], [CX - 70, 104], t), hR: lp([CX + 12, 108], [CX + 70, 104], t), hintL: [-0.3, 1], hintR: [0.3, 1] }, FSIT));
+      return P;
+    }
+    const a = lerp(5, 86, t), P = front({ shY: 114, head: [CX, 110], aL: a, aR: a });
+    P.items = o.load === 'cable' ? [cable([CX + 60, 199], lastPt(P.armL), 1), cable([CX - 60, 199], lastPt(P.armR), 1)] : heldFront(P, 'db');
+    return P;
+  }
+});
+A('pullApart', {
+  view: 'front', first: 'up', L: ['Pull apart', 'Return'],
+  pose(t) {
+    const P = front({ hL: lp([CX - 9, 86], [CX - 70, 81], t), hR: lp([CX + 9, 86], [CX + 70, 81], t), hintL: [-0.2, 1], hintR: [0.2, 1] });
+    P.items = [band(lastPt(P.armL), lastPt(P.armR))];
+    return P;
+  }
+});
+A('fly', {
+  view: 'front', first: o => (o.pos === 'lying' ? 'down' : 'up'), L: o => (o.pos === 'lying' ? ['Open', 'Close'] : ['Close', 'Open']),
+  props: o => o.pos === 'lying' ? '<rect class="fg-box" x="134" y="30" width="52" height="118" rx="10"/>'
+    : o.pos === 'seat' ? FBENCH : PR.post(34, 20) + PR.post(286, 20) + PR.pulley(37, 26) + PR.pulley(283, 26),
+  pose(t, o) {
+    if (o.pos === 'lying') {
+      const P = front({ hL: lp([CX - 9, 70], [CX - 69, 76], t), hR: lp([CX + 9, 70], [CX + 69, 76], t), hintL: [-0.3, 1], hintR: [0.3, 1] });
+      P.items = o.load === 'cable' ? [cable([CX - 110, 150], lastPt(P.armL), 1), cable([CX + 110, 150], lastPt(P.armR), 1)] : heldFront(P, 'db');
+      return P;
+    }
+    if (o.pos === 'seat') return front(Object.assign({ hL: lp([CX - 66, 98], [CX - 9, 106], t), hR: lp([CX + 66, 98], [CX + 9, 106], t), hintL: [-0.3, 1], hintR: [0.3, 1] }, FSIT));
+    const P = front({ hL: lp([CX - 66, 64], [CX - 8, 122], t), hR: lp([CX + 66, 64], [CX + 8, 122], t), hintL: [-1, 0.5], hintR: [1, 0.5] });
+    P.items = [line(o.load === 'band' ? 'fg-band' : 'fg-cable', [[37, 26], lastPt(P.armL)], 1), line(o.load === 'band' ? 'fg-band' : 'fg-cable', [[283, 26], lastPt(P.armR)], 1)];
+    return P;
+  }
+});
+A('pullUp', {
+  view: 'front', first: 'up', L: ['Pull up', 'Lower'], hold: o => !!o.hang,
+  props: () => PR.post(92, 34) + PR.post(228, 34),
+  pose(t, o) {
+    const dy = o.hang ? 0 : lerp(0, -38, t);
+    const P = front({ dy, shY: 86, hipY: 132, hL: [CX - 31, 36], hR: [CX + 31, 36], hintL: [-1, 0.5], hintR: [1, 0.5], fL: [CX - 9, 190 + dy], fR: [CX + 9, 190 + dy] });
+    P.items = [{ k: 'bar', a: [96, 34], b: [224, 34], ext: 0, bare: 1, back: 1 }];
+    return P;
+  }
+});
+A('pulldown', {
+  view: 'front', first: 'up', L: ['Pull down', 'Return'],
+  props: () => FBENCH,
+  pose(t) {
+    const y = lerp(53, 97, t), P = front(Object.assign({ hL: [CX - 36, y], hR: [CX + 36, y], hintL: [-1, 0.5], hintR: [1, 0.5] }, FSIT));
+    P.items = [cable([CX, 4], [CX, y], 1), { k: 'bar', a: [CX - 36, y], b: [CX + 36, y], ext: 12, bare: 1 }];
+    return P;
+  }
+});
+A('sideBend', {
+  view: 'front', first: 'down', L: ['Bend', 'Return'], holdable: 1,
+  pose(t, o, c) {
+    const k = o.hold ? 0.7 + 0.3 * pulse(c) : t, tilt = (o.hold ? 27 : 21) * k;
+    const P = front({ tilt, aR: 5 - tilt * 0.2, hL: o.load ? [CX - 24, 116] : [CX + 12 + tilt, 30 + tilt * 0.5], hintL: [-1, -0.6] });
+    P.items = o.load === 'cable' ? [cable([CX + 70, 30], lastPt(P.armR), 1)] : o.load ? [o.load === 'bb' ? { k: 'dbf', p: lastPt(P.armR) } : (o.load === 'kb' ? kbell(lastPt(P.armR)) : { k: 'dbf', p: lastPt(P.armR) })] : [];
+    return P;
+  }
+});
+A('twist', {
+  view: 'front', lin: 1,
+  tl: () => [{ l: 'Turn', k: 'up', d: 1, a: 0, b: 1, side: 0 }, { l: 'Centre', k: 'down', d: 0.8, a: 1, b: 0, side: 0 }, { l: 'Turn', k: 'up', d: 1, a: 0, b: 1, side: 1 }, { l: 'Centre', k: 'down', d: 0.8, a: 1, b: 0, side: 1 }],
+  props: () => PR.mat,
+  pose(t, o, c) {
+    const s = (c >= 0.5 ? -1 : 1) * easeIO(t), h = [CX + 46 * s, 176 + 6 * Math.abs(s)];
+    const P = front({ hipY: 190, shY: 146, sw: 19 - 5 * Math.abs(s), sc: [CX + 5 * s, 146], head: [CX + 7 * s, 119], hL: add(h, [-4, 0]), hR: add(h, [4, 0]), hintL: [-0.4, 1], hintR: [0.4, 1],
+      kL: [CX - 22, 166], kR: [CX + 22, 166], fL: [CX - 15, 198], fR: [CX + 15, 198] });
+    P.items = [mball(h, o.load === 'ball' ? 10 : 8)];
+    return P;
+  }
+});
+A('starJump', {
+  view: 'front', lin: 1, tl: () => [{ l: 'Out', k: 'up', d: 0.45, a: 0, b: 1, side: 0 }, { l: 'In', k: 'down', d: 0.45, a: 1, b: 0, side: 0 }],
+  pose(t) { const a = lerp(8, 150, t), dy = -10 * Math.sin(Math.PI * t), w = lerp(13, 40, t); return front({ dy, aL: a, aR: a, fL: [CX - w, 199 + dy * 0.6], fR: [CX + w, 199 + dy * 0.6] }); }
+});
+A('lateralHop', {
+  view: 'front', lin: 1, tl: () => [{ l: 'Hop', k: 'up', d: 0.55, a: 0, b: 1, side: 0 }, { l: 'Hop', k: 'up', d: 0.55, a: 0, b: 1, side: 1 }],
+  props: () => '<path class="fg-guide" d="M160 186 L160 204"/>',
+  pose(t, o, c) {
+    const x = (c >= 0.5 ? -1 : 1) * lerp(-26, 26, easeIO(t)), dy = -16 * Math.sin(Math.PI * t), cx = CX + x;
+    return front({ cx, dy, hL: [cx - 24, 112 + dy], hR: [cx + 24, 112 + dy], hintL: [-1, 0.4], hintR: [1, 0.4], fL: [cx - 8, 199 + dy], fR: [cx + 8, 199 + dy] });
+  }
+});
+A('legSwingF', {
+  view: 'front', first: 'up', L: ['Lift', 'Lower'],
+  props: o => PR.post(92, 96),
+  pose(t, o) {
+    const a = lerp(4, 38, t), hipR = [CX + 10, 124], kR = [hipR[0] + Math.sin(rad(a)) * 40, hipR[1] + Math.cos(rad(a)) * 40], aR = [hipR[0] + Math.sin(rad(a)) * 77, hipR[1] + Math.cos(rad(a)) * 77];
+    const P = front({ cx: CX, hL: [96, 112], hintL: [-0.2, 1], hR: [CX + 18, 118], hintR: [1, 0.2], fL: [CX - 12, 199], legR: [hipR, kR, aR, [aR[0] + 8, aR[1] + 1]] });
+    P.items = o.load === 'band' ? [band([CX - 12, 195], aR)] : o.load === 'cable' ? [cable([94, 199], aR)] : [];
+    return P;
+  }
+});
+
+A('rotation', {
+  view: 'front', first: 'up', L: o => (o.inward ? ['Rotate in', 'Return'] : ['Rotate out', 'Return']),
+  props: o => (o.load === 'cable' || o.load === 'band') ? PR.post(o.inward ? 62 : 258, 70) + PR.pulley(o.inward ? 64 : 256, 107) : '',
+  pose(t, o) {
+    // elbow pinned to the side; the forearm sweeps across the body, so from the front the hand slides sideways
+    const el = [CX - 22, 105], k = o.inward ? 1 - t : t, a = lerp(64, -78, k), hd = [el[0] + Math.sin(rad(a)) * 25, el[1] + 1.5 - Math.abs(Math.cos(rad(a))) * 3];
+    const P = front({ armL: [el, hd], aR: 6 });
+    P.items = (o.load === 'cable' || o.load === 'band') ? [line(o.load === 'band' ? 'fg-band' : 'fg-cable', [[o.inward ? 64 : 256, 107], hd], o.inward ? 1 : 0)] : [{ k: 'dbf', p: hd }];
+    return P;
+  }
+});
+A('highCurl', {
+  view: 'front', first: 'up', L: ['Curl', 'Return'],
+  props: () => PR.post(34, 20) + PR.post(286, 20) + PR.pulley(37, 60) + PR.pulley(283, 60),
+  pose(t) {
+    const ph = rad(lerp(180, 66, t)), eL = [CX - 46, 77], eR = [CX + 46, 77];
+    const hL = [eL[0] + 25 * Math.cos(ph), eL[1] - 25 * Math.sin(ph)], hR = [eR[0] - 25 * Math.cos(ph), eR[1] - 25 * Math.sin(ph)];
+    const P = front({ armL: [eL, hL], armR: [eR, hR] });
+    P.items = [cable([37, 60], hL, 1), cable([283, 60], hR, 1)];
+    P.headTop = true;
+    return P;
+  }
+});
+A('thighMachine', {
+  view: 'front', first: 'up', L: o => (o.dir === 'in' ? ['Squeeze in', 'Open'] : ['Push out', 'Return']),
+  props: () => FBENCH,
+  pose(t, o) {
+    const k = o.dir === 'in' ? 1 - t : t, w = lerp(13, 40, k), s = o.dir === 'in' ? -1 : 1;
+    const P = front(Object.assign({}, FSIT, { kL: [CX - w, 160], kR: [CX + w, 160], fL: [CX - w - 3, 199], fR: [CX + w + 3, 199], hL: [CX - 31, 150], hR: [CX + 31, 150], hintL: [-1, 0.3], hintR: [1, 0.3] }));
+    P.items = [{ k: 'ring', p: [CX - w - s * 10, 160], r: 5.5, cls: 'fg-gear' }, { k: 'ring', p: [CX + w + s * 10, 160], r: 5.5, cls: 'fg-gear' }];
+    return P;
+  }
+});
+
+/* ---- loosening up ---- */
+A('armCircles', {
+  view: 'front', loop: 1.5,
+  pose(t, o, c) {
+    const a = c * 2 * Math.PI * (o.dir || 1), off = [3.5 * Math.cos(a), 11 * Math.sin(a)], shL = [CX - 19, 78], shR = [CX + 19, 78];
+    const hL = [shL[0] - 50 - off[0], shL[1] + off[1]], hR = [shR[0] + 50 + off[0], shR[1] + off[1]];
+    const P = front({ armL: [lp(shL, hL, 0.52), hL], armR: [lp(shR, hR, 0.52), hR] });
+    P.items = [{ k: 'guide', cx: shL[0] - 50, cy: 78, rx: 5, ry: 13 }, { k: 'guide', cx: shR[0] + 50, cy: 78, rx: 5, ry: 13 }];
+    return P;
+  }
+});
+A('hipCircles', {
+  view: 'front', loop: 2.6,
+  pose(t, o, c) {
+    const a = c * 2 * Math.PI * (o.dir || 1), px = 12 * Math.cos(a), py = 3 * Math.sin(a);
+    const P = front({ hipX: px, hipY: 125 + py, sc: [CX - px * 0.3, 78], head: [CX - px * 0.2, 50], hL: [CX - 16 + px, 120 + py], hR: [CX + 16 + px, 120 + py], hintL: [-1, 0.25], hintR: [1, 0.25], fL: [CX - 17, 199], fR: [CX + 17, 199] });
+    P.items = [{ k: 'guide', cx: CX, cy: 126, rx: 33, ry: 8 }, { k: 'dot', p: [CX + 33 * Math.cos(a), 126 + 8 * Math.sin(a)] }];
+    return P;
+  }
+});
+
+/* ---- stretches seen from the front (held, with a gentle pulse) ---- */
+A('stTriceps', {
+  view: 'front', loop: 5,
+  pose(t, o, c) { const p = pulse(c), P = front({ armR: [[CX + 26, 48 - p], [CX + 6, 64]], hL: [CX + 25, 46 - p], hintL: [0, -1] }); P.headTop = true; return P; }
+});
+A('stCrossArm', {
+  view: 'front', loop: 5,
+  pose(t, o, c) { const p = pulse(c); return front({ armR: [[CX - 4, 84], [CX - 30 - 2 * p, 82]], hL: [CX - 8 - 2 * p, 92], hintL: [-1, 0.8] }); }
+});
+A('stReach', {
+  view: 'front', loop: 5,
+  pose(t, o, c) { const p = pulse(c), dy = -3 * p, P = front({ dy: 0, shY: 78 + dy, head: [CX, 51 + dy * 0.6], hL: [CX - 5, 26 + dy * 1.5], hR: [CX + 5, 26 + dy * 1.5], hintL: [-1, 0], hintR: [1, 0] }); P.headTop = true; return P; }
+});
+A('stNeck', {
+  view: 'front', loop: 5,
+  pose(t, o, c) {
+    const p = 0.6 + 0.4 * pulse(c);
+    const P = o.fwd ? front({ head: [CX, 50 + 7 * p], hL: [CX - 8, 44 + 5 * p], hR: [CX + 8, 44 + 5 * p], hintL: [-1, 0], hintR: [1, 0] })
+      : front({ head: [CX + 9 * p, 52 + 2 * p], hR: [CX + 2 * p, 40 + 2 * p], hintR: [1, -0.4], aL: 6 });
+    P.headTop = true; return P;
+  }
+});
+A('stChest', {
+  view: 'front', loop: o => (o.dyn ? 1.8 : 5),
+  pose(t, o, c) {
+    const p = pulse(c), k = o.dyn ? p : 0.8 + 0.2 * p;
+    return front({ hL: lp([CX - 10, 84], [CX - 66, 70], k), hR: lp([CX + 10, 84], [CX + 66, 70], k), hintL: [-0.4, 1], hintR: [0.4, 1] });
+  }
+});
+A('stButterfly', {
+  view: 'front', loop: 5, floor: true, props: () => PR.mat,
+  pose(t, o, c) {
+    const p = pulse(c), d = 3 * p;
+    return front({ hipY: 188, shY: 142 + d, head: [CX, 115 + d * 1.6], kL: [CX - 44, 190 + d], kR: [CX + 44, 190 + d], fL: [CX - 5, 197], fR: [CX + 5, 197], hL: [CX - 8, 190], hR: [CX + 8, 190], hintL: [-1, 0.2], hintR: [1, 0.2],
+      legL: [[CX - 10, 188], [CX - 44, 190 + d], [CX - 5, 197], [CX - 3, 199]], legR: [[CX + 10, 188], [CX + 44, 190 + d], [CX + 5, 197], [CX + 3, 199]] });
+  }
+});
+A('stSideLunge', {
+  view: 'front', loop: 5,
+  pose(t, o, c) {
+    const p = pulse(c), x = 22 + 4 * p, y = 150 + 4 * p;
+    return front({ hipX: x, hipY: y, shY: y - 46, hL: [CX + x - 16, y - 8], hR: [CX + x + 18, y - 6], hintL: [-1, 0.3], hintR: [1, 0.3], fL: [CX - 44, 199], fR: [CX + 44, 199], kR: [CX + 50, 166], kL: [CX - 14, 176] });
+  }
+});
+
+/* ===================== Families on the floor, on a bench, seated or hanging (side view) ===================== */
+const SUP = { hip: [143, 194], lean: -90, far: [3, -3] };                  // lying on the back, head to the left
+const FEET_FLAT = { nF: [176, 199], lHint: [0, -1], fOff: [8, 0] };
+const FLAT_BENCH = PR.bench(66, 172, 162);
+const handsAtHead = (head) => ({ nH: add(head, [3, -7]), aHint: [0.4, -1] });
+
+A('bridge', {
+  view: 'side', floor: true, first: 'up', L: ['Lift', 'Lower'],
+  props: o => o.bench ? PR.bench(62, 118, 168) : PR.mat,
+  pose(t, o) {
+    let sh, hip, head;
+    if (o.bench) { sh = [100, 154]; head = [78, 149]; hip = pol(sh, 90 + lerp(-40, -2, t), B.torso); }
+    else { sh = [95, 194]; head = [71, 194]; hip = pol(sh, 90 + lerp(0, 22.7, t), B.torso); }
+    const feet = o.bench ? { nF: [190, 199], lHint: [0, -1], fOff: [8, 0] } : FEET_FLAT;
+    const spec = Object.assign({ sh, hip, head, far: [3, -3], nArm: o.bench ? [[112, 176], [124, 198]] : [[120, 200], [145, 200]] }, feet);
+    if (o.single) { const a = lerp(100, 113, t); delete spec.nF; spec.nL = [a, a]; spec.fF = [184, 199]; spec.fLHint = [0, -1]; }
+    const P = fig(spec);
+    if (o.load === 'bb') P.items = [plate(add(hip, [2, -13]), 0)];
+    if (o.band) { const k = P.nLeg[1], dd = [k[0] - hip[0], k[1] - hip[1]], n = Math.hypot(dd[0], dd[1]), cc = [k[0] - dd[0] / n * 9, k[1] - dd[1] / n * 9], q = [-dd[1] / n * 9.5, dd[0] / n * 9.5]; P.items = [line('fg-strap', [add(cc, q), [cc[0] - q[0], cc[1] - q[1]]])]; }
+    return P;
+  }
+});
+
+const BENCH_SET = {
+  flat: { props: FLAT_BENCH, hip: [152, 148.5], lean: -90, top: [106, 97.5], bot: [110, 134], feet: [198, 199] },
+  incline: { props: PR.seg(144, 172, 84, 126) + PR.seg(140, 172, 178, 172) + PR.seg(150, 176, 150, 203) + PR.seg(100, 142, 100, 203), hip: [150, 160], lean: -52, top: [118, 79], bot: [127, 121], feet: [196, 199] },
+  decline: { props: PR.seg(166, 150, 66, 183) + PR.seg(150, 158, 150, 203) + PR.seg(84, 180, 84, 203), hip: [148, 142], lean: -108, top: [99, 106], bot: [108, 144], feet: [190, 199] },
+  floor: { props: PR.mat, hip: [143, 194], lean: -90, top: [97, 143], bot: [104, 177], feet: [176, 199] }
+};
+function onBench(inc, armSpec) {
+  const b = BENCH_SET[inc] || BENCH_SET.flat;
+  return fig(Object.assign({ hip: b.hip, lean: b.lean, far: [3, -3], nF: b.feet, lHint: [0.25, -1], fOff: [8, 0] }, armSpec));
+}
+A('benchPress', {
+  view: 'side', first: 'down', L: ['Lower', 'Press'], floor: o => o.inc === 'floor',
+  props: o => (BENCH_SET[o.inc] || BENCH_SET.flat).props,
+  pose(t, o) {
+    const b = BENCH_SET[o.inc] || BENCH_SET.flat, P = onBench(o.inc, { nH: lp(b.top, b.bot, t), aHint: [1, 0.5] }), h = hand(P);
+    P.items = o.load === 'band' ? [band([h[0], b.hip[1] + 16], h, 1)] : o.load === 'cable' ? [cable([h[0] + 30, 199], h, 1)] : held(P, o.load || 'bb');
+    return P;
+  }
+});
+A('skull', {
+  view: 'side', first: 'down', L: ['Lower', 'Extend'],
+  props: () => FLAT_BENCH,
+  pose(t, o) { const P = onBench('flat', { nA: [177, lerp(183, 262, t)] }); P.items = o.load === 'band' || o.load === 'cable' ? [line(o.load === 'band' ? 'fg-band' : 'fg-cable', [[40, 150], hand(P)], 1)] : held(P, o.load || 'bb').slice(-1); return P; }
+});
+A('pullover', {
+  view: 'side', first: 'down', L: ['Reach back', 'Pull over'],
+  props: () => FLAT_BENCH,
+  pose(t, o) { const a = lerp(176, 254, t), P = onBench('flat', { nA: [a, a + 12] }); P.items = held(P, o.load || 'db').slice(-1); P.headTop = true; return P; }
+});
+
+function curlUp(lean, tuck) { const hip = SUP.hip, sh = shOf(hip, lean), head = pol(sh, 180 - (lean + tuck), B.neck); return { hip, lean, sh, head }; }
+A('crunch', {
+  view: 'side', floor: true, first: 'up', L: ['Curl up', 'Lower'],
+  props: o => PR.mat,
+  pose(t, o) {
+    if (o.ball) {
+      const hip = [152, 170], lean = lerp(-72, -44, t), sh = shOf(hip, lean), head = pol(sh, 180 - (lean + 12 * t), B.neck);
+      const P = fig(Object.assign({ hip, lean, head, far: [3, -3], nF: [198, 199], lHint: [0.3, -1], fOff: [8, 0], bend: -6 * t }, handsAtHead(head)));
+      P.items = [{ k: 'ring', p: [128, 180], r: 25, cls: 'fg-ballbig', back: 1 }];
+      return P;
+    }
+    const b = curlUp(lerp(-90, -62, t), 10 * t);
+    if (o.legsUp) return fig({ hip: b.hip, lean: b.lean, head: b.head, far: [3, -3], bend: -7 * t, nL: [177, 179], nA: [lerp(170, 150, t), lerp(170, 152, t)] });
+    return fig(Object.assign({ hip: b.hip, lean: b.lean, head: b.head, far: [3, -3], bend: -7 * t }, FEET_FLAT, handsAtHead(b.head)));
+  }
+});
+A('situp', {
+  view: 'side', floor: true, first: 'up', L: ['Sit up', 'Lower'],
+  props: () => PR.mat,
+  pose(t) { const b = curlUp(lerp(-90, -10, t), 4); return fig(Object.assign({ hip: b.hip, lean: b.lean, head: b.head, far: [3, -3], bend: -5 * Math.sin(Math.PI * t) }, FEET_FLAT, handsAtHead(b.head))); }
+});
+A('vup', {
+  view: 'side', floor: true, first: 'up', L: ['Fold', 'Lower'],
+  props: () => PR.mat,
+  pose(t) { const lean = lerp(-90, -44, t), a = lerp(92, 132, t), r = lerp(264, 122, t); return fig({ hip: SUP.hip, lean, far: [3, -3], nL: [a, a], nA: [r, r + 4] }); }
+});
+A('legRaise', {
+  view: 'side', floor: true, first: 'up', L: ['Raise', 'Lower'],
+  props: () => PR.mat,
+  pose(t, o) {
+    const base = { hip: SUP.hip, lean: -90, far: [3, -3], nArm: [[120, 200], [145, 200]] };
+    if (o.flutter) { const a = lerp(98, 124, t), b = lerp(124, 98, t); return fig(Object.assign({ nL: [a, a], fL: [b, b] }, base)); }
+    const a = lerp(93, 176, t); return fig(Object.assign({ nL: [a, a] }, base));
+  }
+});
+A('airBike', {
+  view: 'side', floor: true, lin: 1,
+  tl: () => [{ l: 'Twist', k: 'up', d: 1, a: 0, b: 1, side: 0 }, { l: 'Switch', k: 'up', d: 1, a: 0, b: 1, side: 1 }],
+  props: () => PR.mat,
+  pose(t, o, c) {
+    const k = c >= 0.5 ? 1 - easeIO(t) : easeIO(t), b = curlUp(-72, 10);
+    const legOf = q => [lerp(104, 156, q), lerp(98, 78, q)];
+    return fig(Object.assign({ hip: b.hip, lean: b.lean, head: b.head, far: [3, -3], bend: -6, nL: legOf(k), fL: legOf(1 - k) }, handsAtHead(b.head)));
+  }
+});
+A('deadbug', {
+  view: 'side', floor: true, lin: 1,
+  tl: (D, U) => [{ l: 'Reach out', k: 'down', d: D, a: 0, b: 1, side: 0 }, { l: 'Come back', k: 'up', d: U, a: 1, b: 0, side: 0 }, { l: 'Other side', k: 'down', d: D, a: 0, b: 1, side: 1 }, { l: 'Come back', k: 'up', d: U, a: 1, b: 0, side: 1 }],
+  props: () => PR.mat,
+  pose(t, o, c) {
+    const side = c >= 0.5 ? 1 : 0, armA = k => { const a = 180 + 76 * k; return [a, a]; };
+    const legA = k => [lerp(180, 100, k), lerp(90, 98, k)];
+    return fig({ hip: [156, 193], lean: -90, far: [3, -3], nA: armA(side === 0 ? t : 0), fA: armA(side === 1 ? t : 0), nL: legA(side === 1 ? t : 0).concat([-90]), fL: legA(side === 0 ? t : 0).concat([-90]) });
+  }
+});
+
+/* ---- push-ups, planks and friends ---- */
+A('pushup', {
+  view: 'side', first: 'down', L: ['Lower', 'Push'], floor: o => (o.v === 'knee' || o.v === 'full' || !o.v || o.v === 'decline'),
+  props: o => o.v === 'wall' ? PR.wall(254) : o.v === 'incline' ? '<path class="fg-prop" d="M222 143.5 L304 143.5 M238 148 L238 203 M296 148 L296 203"/>' : o.v === 'knee' ? PR.pad : o.v === 'decline' ? PR.box(44, 56, 36) : '',
+  pose(t, o) {
+    const v = o.v || 'full';
+    if (v === 'wall') {
+      const an = [170, 199], th = lerp(11.5, 25, t), Pt = l => pol(an, 180 - th, l), sh = Pt(126), hip = Pt(78), kn = Pt(38), hd = [247.5, 80];
+      const P = fig({ sh, hip, head: pol(sh, 180 - th + 8, B.neck), nH: hd, aHint: [-0.2, 1], fH: add(hd, [0, -6]), far: [4, -2], nF: an, fF: add(an, [8, 0]) });
+      P.nLeg = [hip, kn, an, [an[0] + 13, 199]]; P.fLeg = [add(hip, [5, -1]), add(kn, [6, 0]), add(an, [8, 0]), [an[0] + 21, 199]];
+      return P;
+    }
+    if (v === 'knee') {
+      const kn = [121, 191], a = lerp(28, 7, t), Pt = l => pol(kn, 90 + a, l), sh = Pt(88), hip = Pt(40), hd = [198, 199];
+      const P = fig({ sh, hip, head: pol(sh, 90 + a + 14, B.neck), nH: hd, aHint: [-1, -0.3], fH: add(hd, [6, 0]), far: [3, -3], nF: [84, 198.5] });
+      P.nLeg = [hip, kn, [84, 198.5], [72, 199.5]]; P.fLeg = [add(hip, [3, -3]), add(kn, [5, -1]), [88, 194], [77, 192]];
+      return P;
+    }
+    const S = { full: { an: [81, 196], a: [21.9, 4.6], hd: [200, 199], toe: [5, 7] }, incline: { an: [109, 197], a: [46.5, 33], hd: [232, 135.5], toe: [8, 2.5] }, decline: { an: [78, 163], a: [5.9, -10.5], hd: [203, 199], toe: [-10, 2] } }[v];
+    const a = lerp(S.a[0], S.a[1], t), Pt = l => pol(S.an, 90 + a, l), sh = Pt(126), hip = Pt(78), kn = Pt(38);
+    const P = fig({ sh, hip, head: pol(sh, 90 + a + 12, B.neck), nH: S.hd, aHint: v === 'incline' ? [-0.6, 1] : [-1, -0.3], fH: add(S.hd, [5, 0]), far: [3, -3], nF: S.an });
+    P.nLeg = [hip, kn, S.an, add(S.an, S.toe)]; P.fLeg = [add(hip, [4, -2]), add(kn, [5, -1]), add(S.an, [7, 0]), add(S.an, [S.toe[0] + 7, S.toe[1]])];
+    return P;
+  }
+});
+A('plank', {
+  view: 'side', floor: true, loop: 4, hold: 1,
+  props: o => (o.v === 'knee' ? PR.pad : PR.mat),
+  pose(t, o, c) {
+    const b = Math.sin(c * 2 * Math.PI) * 0.9, sh = [207, 172 + b];
+    if (o.v === 'knee') {
+      const kn = [121, 191], d = [sh[0] - kn[0], sh[1] - kn[1]], n = Math.hypot(d[0], d[1]), hip = [kn[0] + d[0] / n * 40, kn[1] + d[1] / n * 40 + b * 0.5];
+      const P = fig({ sh, hip, head: [sh[0] + 22, sh[1] - 8 + b * 0.4], far: [3, -3], nArm: [[207, 199], [232, 199]], fArm: [[212.5, 198], [237.5, 198]], nF: [84, 198.5] });
+      P.nLeg = [hip, kn, [84, 198.5], [72, 199.5]]; P.fLeg = [add(hip, [3, -3]), add(kn, [5, -1]), [88, 194], [77, 192]];
+      return P;
+    }
+    const an = [83.3, 196], hip = lp(an, sh, 78 / 126), kn = lp(an, sh, 38 / 126);
+    const P = fig({ sh, hip, head: [sh[0] + 22, sh[1] - 8 + b * 0.4], far: [3, -3], nArm: [[207, 199], [232, 199]], fArm: [[212.5, 198], [237.5, 198]], nF: an });
+    P.nLeg = [hip, kn, an, [88, 203]]; P.fLeg = [add(hip, [3, -3]), add(kn, [4, -2]), add(an, [6, 0]), [94, 203]];
+    return P;
+  }
+});
+A('sidePlank', {
+  view: 'side', floor: true, loop: 4, hold: 1,
+  props: () => PR.mat,
+  pose(t, o, c) {
+    const b = Math.sin(c * 2 * Math.PI) * 0.9, sh = [204, 156 + b], an = [84, 197], hip = lp(an, sh, 78 / 126), kn = lp(an, sh, 38 / 126);
+    const P = fig({ sh, hip, head: [sh[0] + 21, sh[1] - 12], far: [0, 0], nA: [178, 180], fArm: [[204, 183], [226, 199]], nF: an });
+    P.nLeg = [hip, kn, an, [92, 202]]; P.fLeg = [hip, kn, add(an, [4, 2]), [96, 203]];
+    return P;
+  }
+});
+A('mountainClimber', {
+  view: 'side', floor: true, loop: 0.75,
+  pose(t, o, c) {
+    const an = [81, 196], ang = 22, Pt = l => pol(an, 90 + ang, l), sh = Pt(126), hip = Pt(78), k = pulse(c), k2 = pulse(c + 0.5);
+    const foot = q => lp(an, [150, 189], q);
+    return fig({ sh, hip, head: pol(sh, 90 + ang + 12, B.neck), far: [3, -3], nH: [200, 199], aHint: [-1, -0.3], fH: [205, 199], nF: foot(k), fF: foot(k2), lHint: [0.4, 1], nToe: add(foot(k), [5, 7]), fToe: add(foot(k2), [5, 7]) });
+  }
+});
+A('rollout', {
+  view: 'side', floor: true, first: 'down', L: ['Roll out', 'Pull back'],
+  pose(t, o) {
+    const hip = lp([124, 155], [150, 181], t), lean = lerp(79, 101, t), w = lp([170, 195], [245, 195], t);
+    const P = fig({ hip, lean, headLean: lean - 14, far: [3, -3], nH: add(w, [0, -4]), aHint: [0, -1], nF: [76, 197], lHint: [0.4, 1], nToe: [64, 199] });
+    P.items = [o.load === 'bb' ? plate(w, 0) : { k: 'ring', p: w, r: 9 }];
+    return P;
+  }
+});
+A('superman', {
+  view: 'side', floor: true, first: 'up', L: ['Lift', 'Lower'], holdable: 1,
+  props: () => PR.mat,
+  pose(t, o, c) {
+    const k = o.hold ? 0.75 + 0.25 * pulse(c) : t, lean = lerp(90, 80, k), a = lerp(92, 112, k), l = lerp(270, 256, k);
+    return fig({ hip: [140, 196], lean, headLean: lean - 12 * k - 4, far: [3, -3], nA: [a, a], nL: [l, l, 0] });
+  }
+});
+A('hyperext', {
+  view: 'side', first: 'up', L: ['Raise', 'Lower'],
+  props: () => PR.seg(122, 168, 162, 150) + PR.seg(142, 162, 142, 203) + PR.seg(80, 196, 96, 180),
+  pose(t) {
+    const hip = [150, 146], lean = lerp(148, 62, t), sh = shOf(hip, lean);
+    return fig({ hip, lean, headLean: lean - 8, far: [3, -3], nL: [300, 300, 60], nH: tf(sh, lean, 12, -16), aHint: [0.3, 1] });
+  }
+});
+A('dip', {
+  view: 'side', first: 'down', L: ['Lower', 'Push up'],
+  props: o => o.v === 'bars' ? PR.post(166, 122) + PR.seg(150, 122, 184, 122) : PR.bench(84, 142, 166),
+  pose(t, o) {
+    if (o.v === 'bars') {
+      const sh = lp([166, 70], [171, 100], t), lean = lerp(4, 16, t), hip = pol(sh, -lean, B.torso);
+      return fig({ sh, hip, head: pol(sh, 180 - lean * 0.5, B.neck), nH: [166, 119], aHint: [-1, 0.1], nL: [lerp(8, 4, t), 262, 120] });
+    }
+    const sh = lp([140, 110], [143, 138], t), hip = [sh[0] + 6, sh[1] + 47.6];
+    return fig({ sh, hip, head: [sh[0] + 3, sh[1] - B.neck], nH: [137, 161], aHint: [-1, 0], nF: [216, 197], lHint: [0, -1], nToe: [221, 186], fOff: [0, 0], far: [4, -2] });
+  }
+});
+A('invRow', {
+  view: 'side', first: 'up', L: ['Pull', 'Lower'],
+  props: () => PR.post(98, 108) + PR.post(138, 108),
+  pose(t) {
+    const an = [236, 199], ph = lerp(17, 34.3, t), Pt = l => pol(an, 270 - ph, l), sh = Pt(126), hip = Pt(78), kn = Pt(38);
+    const P = fig({ sh, hip, head: pol(sh, 270 - ph - 10, B.neck), far: [-3, -3], nH: [118, 112], aHint: [-0.5, 1], nF: an });
+    P.nLeg = [hip, kn, an, [240, 187]]; P.fLeg = [add(hip, [-3, -3]), add(kn, [-3, -3]), add(an, [-5, 0]), [235, 187]];
+    P.items = [{ k: 'ring', p: [118, 110], r: 4.5, cls: 'fg-gear' }];
+    return P;
+  }
+});
+A('kickback', {
+  view: 'side', first: 'up', L: ['Kick back', 'Return'], floor: o => o.pos !== 'stand',
+  props: o => o.pos === 'stand' ? PR.post(226, 96) + PR.pulley(226, 199) : PR.mat,
+  pose(t, o) {
+    if (o.pos === 'stand') {
+      const a = lerp(6, -42, t), P = fig({ hip: [168, 122], lean: lerp(10, 22, t), fF: [172, 199], nL: [a, a - 4], nH: [222, 108], aHint: [0, 1] });
+      P.items = [cable([226, 199], P.nLeg[2])];
+      return P;
+    }
+    const th = lerp(360, 268, t);
+    return fig({ hip: [140, 153], lean: 88, headLean: 76, far: [3, -3], nH: [190, 199], aHint: [-1, 0], fL: [0, 270, 0], nL: [th, lerp(270, 266, t), 0] });
+  }
+});
+
+/* ---- seated machines and cable stations ---- */
+const MSEAT = PR.seg(132, 172, 176, 172) + PR.seg(134, 170, 122, 108) + PR.seg(154, 176, 154, 203);
+A('legExt', {
+  view: 'side', first: 'up', L: ['Extend', 'Lower'],
+  props: () => MSEAT,
+  pose(t) { const P = fig({ hip: [150, 159], lean: -10, nL: [88, lerp(6, 84, t)], nH: [160, 168], aHint: [-1, 0.2], fOff: [0, 0] }); P.items = [{ k: 'ring', p: add(P.nLeg[2], [6, -7]), r: 6.5, cls: 'fg-gear' }]; return P; }
+});
+A('legCurl', {
+  view: 'side', first: 'up', L: ['Curl', 'Return'],
+  props: o => o.pos === 'seated' ? MSEAT : o.pos === 'standing' ? PR.post(214, 96) : PR.bench(84, 208, 166),
+  pose(t, o) {
+    if (o.pos === 'seated') { const P = fig({ hip: [150, 159], lean: -10, nL: [88, lerp(78, -22, t)], nH: [160, 168], aHint: [-1, 0.2], fOff: [0, 0] }); P.items = [{ k: 'ring', p: add(P.nLeg[2], [-7, 5]), r: 6.5, cls: 'fg-gear' }]; return P; }
+    if (o.pos === 'standing') { const P = fig({ hip: [166, 122], lean: 6, fF: [168, 199], nL: [-2, lerp(-2, -104, t)], nH: [211, 112], aHint: [0, 1] }); P.items = [{ k: 'ring', p: add(P.nLeg[2], [-7, 0]), r: 6.5, cls: 'fg-gear' }]; return P; }
+    const P = fig({ hip: [150, 152], lean: 90, headLean: 84, far: [3, -3], nL: [270, lerp(270, 188, t)], nH: [206, 170], aHint: [0.2, 1] });
+    P.items = [{ k: 'ring', p: add(P.nLeg[2], [-2, -8]), r: 6.5, cls: 'fg-gear' }];
+    return P;
+  }
+});
+A('legPress', {
+  view: 'side', first: 'down', L: ['Lower', 'Press'],
+  props: () => PR.seg(96, 150, 136, 196) + PR.seg(120, 196, 150, 196),
+  pose(t) {
+    const an = lp([196, 124], [176, 148], t), P = fig({ hip: [128, 182], lean: -42, nF: an, lHint: [-0.3, -1], nToe: [an[0] + 9, an[1] - 10], fOff: [0, 0], nH: [136, 192], aHint: [-1, 0.4] });
+    const d = [0.69, -0.72], n = [0.72, 0.69], c = add(an, [8, -4]);
+    P.items = [line('fg-plates', [[c[0] - n[0] * 22, c[1] - n[1] * 22], [c[0] + n[0] * 22, c[1] + n[1] * 22]])];
+    return P;
+  }
+});
+A('seatedRow', {
+  view: 'side', first: 'up', L: ['Pull', 'Return'],
+  props: () => PR.bench(110, 168, 172) + PR.post(246, 120) + PR.pulley(244, 150) + PR.seg(222, 190, 232, 168),
+  pose(t, o) {
+    const hip = [140, 159], lean = lerp(8, -6, t), sh = shOf(hip, lean);
+    const P = fig({ hip, lean, nF: [220, 184], lHint: [0, -1], nToe: [228, 172], fOff: [0, 0], nH: lp([sh[0] + 49, sh[1] + 20], [sh[0] + 10, sh[1] + 27], t), aHint: [-1, -0.2] });
+    P.items = [line(o.load === 'band' ? 'fg-band' : 'fg-cable', [[244, 150], hand(P)])];
+    return P;
+  }
+});
+A('chestPressSeated', {
+  view: 'side', first: 'up', L: ['Press', 'Return'],
+  props: () => MSEAT,
+  pose(t) {
+    const hip = [150, 159], lean = -10, sh = shOf(hip, lean);
+    const P = fig(Object.assign({ lean, nH: lp([sh[0] + 14, sh[1] + 12], [sh[0] + 50, sh[1] + 10], t), aHint: [-0.3, 1] }, SEATED));
+    P.items = [{ k: 'ring', p: hand(P), r: 5, cls: 'fg-gear' }];
+    return P;
+  }
+});
+A('wristCurl', {
+  view: 'side', first: 'up', L: ['Curl', 'Lower'],
+  props: () => SEAT_BENCH,
+  pose(t, o) {
+    const P = fig(Object.assign({ lean: 34, nArm: [[168, 150], [192, 153]] }, SEATED)), w = [192, 153], h = pol(w, lerp(40, 140, t), 9);
+    P.nArm = [P.sh, [168, 150], w, h]; P.fArm = [add(P.sh, [5, -1]), [171, 149], add(w, [3, -1]), add(h, [3, -1])];
+    P.items = [o.load === 'bb' ? plate(add(h, [2, 0]), 0) : dbell(add(h, [2, 0]))];
+    if (o.load === 'bb') P.items[0].r = 9;
+    return P;
+  }
+});
+A('cableCrunch', {
+  view: 'side', first: 'up', L: ['Crunch', 'Return'],
+  props: () => PR.post(214, 40) + PR.seg(214, 42, 188, 42) + PR.pulley(188, 44),
+  pose(t) {
+    const hip = [140, 156], lean = lerp(14, 72, t), sh = shOf(hip, lean), head = pol(sh, 180 - lean - 12 * t, B.neck);
+    const P = fig({ hip, lean, head, far: [3, -3], bend: 9 * t, nL: [-6, 268, 0], nH: add(head, [8, -8]), aHint: [0.5, -1] });
+    P.items = [cable([188, 44], hand(P), 1)];
+    return P;
+  }
+});
+A('hangRaise', {
+  view: 'side', first: 'up', L: ['Raise', 'Lower'],
+  props: () => PR.seg(128, 30, 196, 30),
+  pose(t) { const P = fig({ hip: [163, 131], lean: lerp(0, -8, t), head: [163, 60], nA: [179, 181], nL: [lerp(4, 86, t), lerp(4, 62, t)] }); P.headTop = true; return P; }
+});
+
+/* ---- cardio machines ---- */
+A('bike', {
+  view: 'side', loop: 1.0,
+  props: () => '<circle class="fg-plate" cx="176" cy="172" r="15"/><path class="fg-prop" d="M150 134 L176 172 L204 126 M150 134 L140 134 M204 126 L212 112 M158 203 L176 172 L196 203"/>',
+  pose(t, o, c) {
+    const a = c * 2 * Math.PI, ped = q => [176 + 13 * Math.sin(q), 172 - 13 * Math.cos(q)], n = ped(a), f = ped(a + Math.PI);
+    return fig({ hip: [147, 121], lean: 26, nF: add(n, [-2, -6]), fF: add(f, [-2, -6]), lHint: [1, -0.6], nToe: add(n, [10, -4]), fToe: add(f, [10, -4]), nH: [210, 113], aHint: [0, 1] });
+  }
+});
+A('rower', {
+  view: 'side', loop: 2.6,
+  props: () => '<path class="fg-prop" d="M70 190 L262 190 M246 190 L246 140"/><circle class="fg-plate" cx="252" cy="150" r="16"/>',
+  pose(t, o, c) {
+    const k = pulse(c), hip = lp([176, 168], [124, 168], k), lean = lerp(14, -14, k), sh = shOf(hip, lean);
+    const P = fig({ hip, lean, nF: [214, 176], lHint: [0, -1], nToe: [222, 164], fOff: [0, 0], nH: lp([sh[0] + 46, sh[1] + 22], [sh[0] + 12, sh[1] + 30], clamp01(k * 1.6 - 0.6)), aHint: [-1, -0.2] });
+    P.items = [cable([240, 152], hand(P))];
+    return P;
+  }
+});
+
+/* ===================== Stretches, foam rolling and close-ups ===================== */
+A('stFold', {
+  view: 'side', loop: 5,
+  pose(t, o, c) {
+    const p = pulse(c), lean = lerp(100, 114, p), hip = [140, 123], sh = shOf(hip, lean);
+    const P = fig({ hip, lean, headLean: lean + 26, nF: [160, 199], lHint: [1, 0], nH: [sh[0] + 3, Math.min(197, sh[1] + 51)], aHint: [1, 0.2] });
+    P.headTop = true; return P;
+  }
+});
+A('stSeatReach', {
+  view: 'side', loop: 5, floor: o => !o.chair, props: o => (o.chair ? CHAIR : PR.mat),
+  pose(t, o, c) {
+    const p = pulse(c);
+    if (o.chair) { const lean = lerp(30, 44, p); return fig({ hip: [143, 162], lean, nF: [206, 196], lHint: [0, -1], nToe: [212, 184], fF: [178, 199], fLHint: [1, -0.4], nH: [196, lerp(176, 182, p)], aHint: [0, -1], bend: 6 }); }
+    const lean = lerp(34, 52, p);
+    return fig({ hip: [116, 194], lean, far: [3, -3], bend: 8, nL: [90, 90, -90], nH: [lerp(176, 190, p), 184], aHint: [0, -1] });
+  }
+});
+A('stLegUp', {
+  view: 'side', loop: 5, floor: true, props: () => PR.mat,
+  pose(t, o, c) {
+    const a = lerp(166, 178, pulse(c)), hip = SUP.hip, k = pol(hip, a, 26);
+    return fig({ hip, lean: -90, far: [3, -3], nL: [a, a, -90], fL: [92, 92], nH: add(k, [-2, 2]), aHint: [0, 1] });
+  }
+});
+A('stQuad', {
+  view: 'side', loop: 5, props: () => PR.wall(232),
+  pose(t, o, c) {
+    const p = pulse(c), P = fig({ hip: [168, 122], lean: 3, fF: [170, 199], nL: [lerp(-8, -16, p), 208, 60], fH: [227, 96], fHint: [0, 1], nH: [150, 150], aHint: [-1, 0] });
+    P.nArm = [P.sh, ik(P.sh, P.nLeg[2], B.ua, B.fa, [-1, 0]).mid, P.nLeg[2]];
+    return P;
+  }
+});
+A('stHipFlexor', {
+  view: 'side', loop: 5, floor: true, props: () => PR.pad.replace('x="97"', 'x="104"'),
+  pose(t, o, c) {
+    const p = pulse(c), hip = [lerp(150, 158, p), lerp(162, 166, p)];
+    return fig({ hip, lean: -4, far: [3, -2], fF: [204, 199], fLHint: [0.4, -1], nF: [86, 197], lHint: [0.4, 1], nToe: [74, 200], nH: add(hip, [6, -10]), aHint: [-1, 0.2] });
+  }
+});
+A('stKneeChest', {
+  view: 'side', loop: 5, floor: true, props: () => PR.mat,
+  pose(t, o, c) {
+    const a = lerp(204, 214, pulse(c)), hip = SUP.hip, kn = pol(hip, a, B.th);
+    return fig({ hip, lean: -90, far: [3, -3], nL: [a, 68, 60], fL: o.both ? [a - 4, 64, 60] : [92, 92], nH: add(kn, [9, 7]), aHint: [0.2, -1] });
+  }
+});
+A('stTwistLying', {
+  view: 'side', loop: 5, floor: true, props: () => PR.mat,
+  pose(t, o, c) {
+    const p = pulse(c);
+    return fig({ hip: SUP.hip, lean: -90, far: [3, -3], nL: [lerp(150, 160, p), lerp(52, 40, p), 60], fL: [92, 92], nArm: [[78, 170], [66, 148]], fArm: [[122, 197], [146, 198]] });
+  }
+});
+A('stSeatTwist', {
+  view: 'front', loop: 5, floor: true, props: () => PR.mat,
+  pose(t, o, c) {
+    const p = 0.7 + 0.3 * pulse(c);
+    return front({ hipY: 188, shY: 142, sw: 19 - 6 * p, sc: [CX - 3 * p, 142], head: [CX - 6 * p, 114], legL: [[CX - 10, 188], [CX - 44, 192], [CX + 6, 197], [CX + 14, 198]], legR: [[CX + 10, 188], [CX + 4, 158], [CX - 22, 196], [CX - 30, 198]],
+      hR: [CX - 2, 160], hintR: [0.6, 1], hL: [CX - 40, 196], hintL: [-1, 0] });
+  }
+});
+A('stChild', {
+  view: 'side', loop: 5, floor: true, props: () => PR.mat,
+  pose(t, o, c) {
+    const p = pulse(c), hip = [122, 176 + p], lean = 100;
+    return fig({ hip, lean, headLean: 104, far: [3, -3], bend: -8, nL: [62, 262, 0], nH: [lerp(214, 222, p), 199], aHint: [0, -1] });
+  }
+});
+A('stCat', {
+  view: 'side', loop: 4, floor: true, props: () => PR.mat,
+  pose(t, o, c) {
+    const p = pulse(c), hip = [140, 153 - 2 * p];
+    return fig({ hip, lean: 88, headLean: lerp(70, 118, p), far: [3, -3], bend: lerp(7, -13, p), nH: [190, 199], aHint: [-1, 0], nL: [0, 270, 0] });
+  }
+});
+A('stSeatFold', {
+  view: 'side', loop: 5, props: () => CHAIR,
+  pose(t, o, c) {
+    const p = pulse(c), lean = lerp(86, 98, p);
+    return fig({ hip: [143, 162], lean, headLean: lean + 20, bend: -8, nF: [186, 199], lHint: [0.4, -1], nH: [196, lerp(190, 198, p)], aHint: [1, -0.4] });
+  }
+});
+A('smr', {
+  view: 'side', loop: 3, floor: true,
+  pose(t, o, c) {
+    const d = 11 * Math.sin(c * 2 * Math.PI), pos = o.pos || 'seated'; let P, r;
+    if (pos === 'prone' || pos === 'side') {
+      const sh = [200 + d, 172], an = [80 + d, 190], hip = lp(an, sh, 78 / 126), kn = lp(an, sh, 38 / 126);
+      P = fig({ sh, hip, head: [sh[0] + 22, sh[1] - 8], far: [3, -3], nArm: [[200 + d, 199], [225 + d, 199]], nF: an });
+      P.nLeg = [hip, kn, an, [72 + d, 192]]; P.fLeg = [add(hip, [3, -3]), add(kn, [3, -3]), add(an, [3, -3]), [75 + d, 189]];
+      r = [136, 196];
+    } else if (pos === 'supine') {
+      const sh = [104 + d, 172], hip = pol(sh, 90 + 8, B.torso);
+      P = fig(Object.assign({ sh, hip, head: [sh[0] - 22, sh[1] - 6], far: [3, -3], nF: [190, 199], lHint: [0, -1], fOff: [8, 0] }, handsAtHead([sh[0] - 22, sh[1] - 6])));
+      r = [114, 196];
+    } else {
+      const hip = [118 + d, 182], lean = -42;                   // hips held off the floor, legs resting on the roller
+      P = fig({ hip, lean, headLean: -20, far: [3, -3], nL: [90, 90, -90], nH: [hip[0] - 40, 199], aHint: [-1, -0.4] });
+      r = [176, 196];
+    }
+    P.items = [{ k: 'ring', p: r, r: 9, cls: 'fg-roller', back: 1 }];
+    return P;
+  }
+});
+
+/* ---- calf stretch at the wall, and the two foot close-ups from the 12-week program ---- */
+A('calf', {
+  view: 'side', loop: 5, props: () => PR.wall(230),
+  pose(t, o, c) {
+    const p = pulse(c), an = [126, 199], lean = lerp(23, 26.5, p), hip = pol(an, 180 - lean, 78), kn = pol(an, 180 - lean, 38);
+    const sh = pol(hip, 180 - (lean - 5), B.torso), hd = [223.5, sh[1] + 2];
+    const P = fig({ sh, hip, head: pol(sh, 172, B.neck), far: [4, -1], nH: hd, aHint: [0, 1], fH: add(hd, [0, -7]), nF: an, fF: [183, 199], fLHint: [1, 0] });
+    P.nLeg = [hip, kn, an, [an[0] + 13, 199]];
+    P.items = [{ k: 'hl', pts: [lp(kn, an, 0.12), lp(kn, an, 0.82)], o: 0.5 + 0.5 * p }];
+    return P;
+  }
+});
+A('plantar', {
+  view: 'custom', loop: 5,
+  build(g) {
+    g.innerHTML = '<path class="fg-prop" d="M252 14 L252 204"/><line class="fg-near" data-k="shin" stroke-width="28" x1="152" y1="152" x2="190" y2="0"/>' +
+      '<polygon class="fg-solid" stroke-width="8" points="128,201 130,168 139,152 165,152 190,180 222,191 224,201"/><line class="fg-near" stroke-width="15" x1="225" y1="197" x2="241" y2="170"/>' +
+      '<polyline class="fg-hl" data-k="hl" stroke-width="4.5" points="140,201 222,201 230,190 239,173"/>';
+    const shin = g.querySelector('[data-k=shin]'), hl = g.querySelector('[data-k=hl]');
+    return (t, o, c) => { const p = pulse(c), k = pol([152, 152], 180 - lerp(13, 25, p), 190); shin.setAttribute('x2', f1(k[0])); shin.setAttribute('y2', f1(k[1])); hl.style.opacity = (0.45 + 0.55 * p).toFixed(2); };
+  }
+});
+A('ball', {
+  view: 'custom', loop: 4,
+  build(g) {
+    g.innerHTML = '<line class="fg-near" data-k="shin" stroke-width="28" x1="152" y1="126" x2="178" y2="-30"/><g data-k="foot"><polygon class="fg-solid" stroke-width="8" points="128,175 130,142 139,126 165,126 190,154 222,165 224,175"/>' +
+      '<line class="fg-near" stroke-width="14" x1="225" y1="171" x2="252" y2="172"/></g><g data-k="ball"><circle class="fg-ball" cx="0" cy="0" r="13"/><path class="fg-ballmark" d="M0 0 L0 -9"/></g>';
+    const shin = g.querySelector('[data-k=shin]'), foot = g.querySelector('[data-k=foot]'), ball = g.querySelector('[data-k=ball]');
+    return (t, o, c) => {
+      const fx = 30 * Math.sin(c * 2 * Math.PI) - 8, bx = 178 + fx / 2;
+      foot.setAttribute('transform', 'translate(' + f1(fx) + ' 0)'); shin.setAttribute('x1', f1(152 + fx));
+      ball.setAttribute('transform', 'translate(' + f1(bx) + ' 192) rotate(' + f1(fx / 2 / 13 * 180 / Math.PI) + ')');
+    };
+  }
+});
+
+/* Exercise catalogue. Names, muscles, equipment, level and type of the source entries come from free-exercise-db (public-domain dedication);
+   entries marked own:1, every animation family assignment and all cue text were written for this app. Generated by tools/classify.py. */
+const CATALOGUE = [{"id":"x_chair_squat","n":"Chair Squat (Sit to Stand)","lv":0,"c":"strength","m":["quadriceps"],"s":"knee","p":3,"m2":["glutes","hamstrings"],"f":"squat","o":{"chair":1},"own":1},{"id":"x_wall_pushup","n":"Wall Push-Up","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":3,"m2":["triceps","shoulders"],"f":"pushup","o":{"v":"wall"},"own":1},{"id":"x_knee_pushup","n":"Knee Push-Up","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":3,"m2":["triceps","shoulders"],"f":"pushup","o":{"v":"knee"},"own":1},{"id":"x_band_row","n":"Standing Band Row","lv":0,"c":"strength","m":["middle back"],"s":"hpull","p":3,"m2":["lats","biceps"],"f":"row","o":{"load":"band"},"nd":["bands"],"own":1},{"id":"x_cable_row_standing","n":"Standing Cable Row","lv":0,"c":"strength","m":["middle back"],"s":"hpull","p":2,"m2":["lats","biceps"],"f":"row","o":{"load":"cable"},"nd":["cable"],"own":1},{"id":"x_knee_plank","n":"Knee Plank","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":3,"m2":["shoulders"],"f":"plank","o":{"v":"knee"},"own":1},{"id":"x_march","n":"Brisk Walk in Place","lv":0,"c":"cardio","m":["quadriceps"],"s":"cardio","p":3,"m2":["calves","glutes"],"f":"walk","own":1},{"id":"x_jog","n":"Jog in Place","lv":0,"c":"cardio","m":["quadriceps"],"s":"cardio","p":3,"m2":["calves","hamstrings"],"f":"run","own":1},{"id":"x_jumping_jack","n":"Jumping Jacks","lv":0,"c":"cardio","m":["quadriceps"],"s":"cardio","p":3,"m2":["shoulders","calves"],"f":"starJump","own":1},{"id":"x_hip_circles","n":"Hip Circles","lv":0,"c":"stretching","m":["abductors"],"s":"stretch","p":3,"m2":["glutes","lower back"],"f":"hipCircles","own":1},{"id":"x_plantar","n":"Plantar Fascia Stretch","lv":0,"c":"stretching","m":["calves"],"s":"stretch","p":1,"f":"plantar","u":"side","own":1},{"id":"x_kb_swing","n":"Kettlebell Swing","lv":1,"c":"strength","m":["hamstrings"],"s":"hip","p":3,"m2":["glutes","lower back","shoulders"],"f":"swing","o":{"load":"kb"},"nd":["kettlebell"],"own":1},{"id":"x_kb_deadlift","n":"Kettlebell Deadlift","lv":0,"c":"strength","m":["hamstrings"],"s":"hip","p":3,"m2":["glutes","lower back"],"f":"deadlift","o":{"load":"kb","style":"conv"},"nd":["kettlebell"],"own":1},{"id":"x_db_goblet_squat","n":"Dumbbell Goblet Squat","lv":0,"c":"strength","m":["quadriceps"],"s":"knee","p":3,"m2":["glutes","hamstrings"],"f":"squat","o":{"load":"goblet"},"nd":["dumbbell"],"own":1},{"id":"x_db_deadlift","n":"Dumbbell Deadlift","lv":0,"c":"strength","m":["hamstrings"],"s":"hip","p":2,"m2":["glutes","lower back"],"f":"deadlift","o":{"load":"db","style":"conv"},"nd":["dumbbell"],"own":1},{"id":"x_split_squat","n":"Split Squat","lv":0,"c":"strength","m":["quadriceps"],"s":"knee","p":3,"m2":["glutes","hamstrings"],"f":"lunge","o":{"mode":"split"},"u":"side","own":1},{"id":"x_reverse_lunge","n":"Reverse Lunge","lv":0,"c":"strength","m":["quadriceps"],"s":"knee","p":3,"m2":["glutes","hamstrings"],"f":"lunge","o":{"mode":"reverse"},"u":"side","own":1},{"id":"x_forward_lunge","n":"Forward Lunge","lv":0,"c":"strength","m":["quadriceps"],"s":"knee","p":2,"m2":["glutes","hamstrings"],"f":"lunge","o":{"mode":"forward"},"u":"side","own":1},{"id":"x_bulgarian","n":"Bulgarian Split Squat","lv":1,"c":"strength","m":["quadriceps"],"s":"knee","p":2,"m2":["glutes","hamstrings"],"f":"lunge","o":{"mode":"bulgarian"},"u":"side","own":1},{"id":"x_step_up","n":"Step-Up","lv":0,"c":"strength","m":["quadriceps"],"s":"knee","p":3,"m2":["glutes","hamstrings"],"f":"stepUp","nd":["box"],"u":"side","own":1},{"id":"x_calf_raise","n":"Standing Calf Raise","lv":0,"c":"strength","m":["calves"],"s":"calves","p":3,"f":"calfRaise","own":1},{"id":"x_lying_leg_raise","n":"Lying Leg Raise","lv":1,"c":"strength","m":["abdominals"],"s":"core","p":3,"f":"legRaise","own":1},{"id":"x_band_curl","n":"Band Biceps Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":3,"m2":["forearms"],"f":"curl","o":{"load":"band","pos":"stand"},"nd":["bands"],"own":1},{"id":"x_band_pushdown","n":"Band Triceps Pushdown","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":3,"f":"pushdown","o":{"load":"band"},"nd":["bands"],"own":1},{"id":"x_band_bent_row","n":"Band Bent-Over Row","lv":0,"c":"strength","m":["middle back"],"s":"hpull","p":2,"m2":["lats","biceps"],"f":"bentRow","o":{"load":"band"},"nd":["bands"],"own":1},{"id":"x_band_deadlift","n":"Band Deadlift","lv":0,"c":"strength","m":["hamstrings"],"s":"hip","p":2,"m2":["glutes","lower back"],"f":"deadlift","o":{"load":"band","style":"conv"},"nd":["bands"],"own":1},{"id":"x_band_chest_press","n":"Standing Band Chest Press","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":3,"m2":["triceps","shoulders"],"f":"standPress","o":{"load":"band"},"nd":["bands"],"own":1},{"id":"x_band_face_pull","n":"Band Face Pull","lv":0,"c":"strength","m":["shoulders"],"s":"rear","p":3,"m2":["middle back","traps"],"f":"facePull","o":{"load":"band"},"nd":["bands"],"own":1},{"id":"x_band_front_raise","n":"Band Front Raise","lv":0,"c":"strength","m":["shoulders"],"s":"delts","p":1,"f":"frontRaise","o":{"load":"band"},"nd":["bands"],"own":1},{"id":"x_farmer_carry","n":"Farmer's Carry","lv":0,"c":"strength","m":["forearms"],"s":"core","p":1,"m2":["traps","abdominals"],"f":"carry","nd":["dumbbell"],"own":1},{"id":"x_db_swing","n":"Dumbbell Swing","lv":1,"c":"strength","m":["hamstrings"],"s":"hip","p":1,"m2":["glutes","lower back","shoulders"],"f":"swing","o":{"load":"db"},"nd":["dumbbell"],"own":1},{"id":"3_4_Sit-Up","n":"3/4 Sit-Up","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"situp"},{"id":"90_90_Hamstring","n":"90/90 Hamstring","lv":0,"c":"stretching","m":["hamstrings"],"s":"stretch","p":1,"m2":["calves"],"f":"stLegUp","u":"side"},{"id":"Ab_Crunch_Machine","n":"Ab Crunch Machine","lv":1,"c":"strength","m":["abdominals"],"s":"core","p":2,"f":"cableCrunch","ax":1,"nd":["machine"]},{"id":"Ab_Roller","n":"Ab Roller","lv":1,"c":"strength","m":["abdominals"],"s":"core","p":0,"m2":["shoulders"],"f":"rollout","nd":["other"]},{"id":"Adductor","n":"Adductor","lv":1,"c":"stretching","m":["adductors"],"s":"stretch","p":1,"f":"smr","o":{"pos":"prone"},"nd":["foamroll"]},{"id":"Adductor_Groin","n":"Adductor/Groin","lv":1,"c":"stretching","m":["adductors"],"s":"stretch","p":2,"f":"stSideLunge","u":"side"},{"id":"Advanced_Kettlebell_Windmill","n":"Advanced Kettlebell Windmill","lv":1,"c":"strength","m":["abdominals"],"s":"core","p":1,"m2":["glutes","hamstrings","shoulders"],"f":"sideBend","o":{"load":"kb"},"ax":1,"nd":["kettlebell"],"u":"side"},{"id":"Air_Bike","n":"Air Bike","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":3,"f":"airBike"},{"id":"All_Fours_Quad_Stretch","n":"All Fours Quad Stretch","lv":1,"c":"stretching","m":["quadriceps"],"s":"stretch","p":1,"m2":["quadriceps"],"f":"stQuad","ax":1,"u":"side"},{"id":"Alternate_Hammer_Curl","n":"Alternate Hammer Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":1,"m2":["forearms"],"f":"curl","o":{"load":"db","pos":"stand"},"nd":["dumbbell"],"u":"alt"},{"id":"Alternate_Heel_Touchers","n":"Alternate Heel Touchers","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":2,"f":"crunch","u":"alt"},{"id":"Alternate_Incline_Dumbbell_Curl","n":"Alternate Incline Dumbbell Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":1,"m2":["forearms"],"f":"curl","o":{"load":"db","pos":"incline"},"nd":["bench","dumbbell"],"u":"alt"},{"id":"Alternate_Leg_Diagonal_Bound","n":"Alternate Leg Diagonal Bound","lv":0,"c":"plyometrics","m":["quadriceps"],"s":"plyo","p":1,"m2":["abductors","adductors","calves","glutes","hamstrings"],"f":"jump","ax":1,"u":"alt"},{"id":"Alternating_Cable_Shoulder_Press","n":"Alternating Cable Shoulder Press","lv":0,"c":"strength","m":["shoulders"],"s":"vpush","p":1,"m2":["triceps"],"f":"ohPress","o":{"load":"cable"},"nd":["cable"],"u":"alt"},{"id":"Alternating_Deltoid_Raise","n":"Alternating Deltoid Raise","lv":0,"c":"strength","m":["shoulders"],"s":"delts","p":1,"f":"lateralRaise","o":{"load":"db"},"nd":["dumbbell"],"u":"alt"},{"id":"Alternating_Floor_Press","n":"Alternating Floor Press","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["abdominals","shoulders","triceps"],"f":"benchPress","o":{"load":"kb","inc":"floor"},"nd":["kettlebell"],"u":"alt"},{"id":"Alternating_Hang_Clean","n":"Alternating Hang Clean","lv":1,"c":"strength","m":["hamstrings"],"s":"olympic","p":1,"m2":["biceps","calves","forearms","glutes","lower back","traps"],"f":"clean","o":{"load":"kb","hang":1},"nd":["kettlebell"],"u":"alt"},{"id":"Alternating_Kettlebell_Press","n":"Alternating Kettlebell Press","lv":1,"c":"strength","m":["shoulders"],"s":"vpush","p":1,"m2":["triceps"],"f":"ohPress","o":{"load":"kb"},"nd":["kettlebell"],"u":"alt"},{"id":"Alternating_Kettlebell_Row","n":"Alternating Kettlebell Row","lv":1,"c":"strength","m":["middle back"],"s":"hpull","p":1,"m2":["biceps","lats"],"f":"bentRow","o":{"load":"kb"},"nd":["kettlebell"],"u":"alt"},{"id":"Alternating_Renegade_Row","n":"Alternating Renegade Row","lv":2,"c":"strength","m":["middle back"],"s":"none","p":1,"m2":["abdominals","biceps","chest","lats","triceps"],"nd":["kettlebell"],"u":"alt"},{"id":"Ankle_Circles","n":"Ankle Circles","lv":0,"c":"stretching","m":["calves"],"s":"none","p":1},{"id":"Ankle_On_The_Knee","n":"Ankle On The Knee","lv":0,"c":"stretching","m":["glutes"],"s":"stretch","p":1,"f":"stKneeChest","ax":1,"u":"side"},{"id":"Anterior_Tibialis-SMR","n":"Anterior Tibialis-SMR","lv":1,"c":"stretching","m":["calves"],"s":"stretch","p":1,"f":"smr","o":{"pos":"seated"},"nd":["foamroll"]},{"id":"Anti-Gravity_Press","n":"Anti-Gravity Press","lv":0,"c":"strength","m":["shoulders"],"s":"none","p":1,"m2":["middle back","traps","triceps"],"nd":["barbell"]},{"id":"Arm_Circles","n":"Arm Circles","lv":0,"c":"stretching","m":["shoulders"],"s":"stretch","p":3,"m2":["traps"],"f":"armCircles"},{"id":"Arnold_Dumbbell_Press","n":"Arnold Dumbbell Press","lv":1,"c":"strength","m":["shoulders"],"s":"vpush","p":2,"m2":["triceps"],"f":"ohPress","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Around_The_Worlds","n":"Around The Worlds","lv":1,"c":"strength","m":["chest"],"s":"none","p":1,"m2":["shoulders"],"nd":["dumbbell"]},{"id":"Atlas_Stone_Trainer","n":"Atlas Stone Trainer","lv":1,"c":"strongman","m":["lower back"],"s":"none","p":0,"m2":["biceps","forearms","glutes","hamstrings","quadriceps"],"nd":["other"]},{"id":"Atlas_Stones","n":"Atlas Stones","lv":2,"c":"strongman","m":["lower back"],"s":"none","p":0,"m2":["abdominals","adductors","biceps","calves","forearms","glutes","hamstrings","middle back","quadriceps","traps"],"nd":["other"]},{"id":"Axle_Deadlift","n":"Axle Deadlift","lv":1,"c":"strongman","m":["lower back"],"s":"hip","p":0,"m2":["forearms","glutes","hamstrings","middle back","quadriceps","traps"],"f":"deadlift","o":{"load":"bb"},"nd":["other"]},{"id":"Back_Flyes_-_With_Bands","n":"Band Back Fly","lv":0,"c":"strength","m":["shoulders"],"s":"rear","p":1,"a":"Back Flyes - With Bands","m2":["middle back","triceps"],"f":"pullApart","nd":["bands"]},{"id":"Backward_Drag","n":"Backward Drag","lv":0,"c":"strongman","m":["quadriceps"],"s":"none","p":0,"m2":["calves","forearms","glutes","hamstrings","lower back"],"nd":["sled"]},{"id":"Backward_Medicine_Ball_Throw","n":"Backward Medicine Ball Throw","lv":0,"c":"plyometrics","m":["shoulders"],"s":"plyo","p":1,"f":"ballSlam","ax":1,"nd":["medball"]},{"id":"Balance_Board","n":"Balance Board","lv":0,"c":"strength","m":["calves"],"s":"none","p":0,"m2":["hamstrings","quadriceps"],"nd":["other"]},{"id":"Ball_Leg_Curl","n":"Ball Leg Curl","lv":0,"c":"strength","m":["hamstrings"],"s":"hipIso","p":2,"m2":["calves","glutes"],"f":"legCurl","o":{"pos":"ball"},"ax":1,"nd":["exball"]},{"id":"Band_Assisted_Pull-Up","n":"Band Assisted Pull-Up","lv":0,"c":"strength","m":["lats"],"s":"vpull","p":3,"m2":["abdominals","forearms","middle back"],"f":"pullUp","nd":["bands","pullupbar"]},{"id":"Band_Good_Morning","n":"Band Good Morning","lv":0,"c":"powerlifting","m":["hamstrings"],"s":"hip","p":2,"m2":["glutes","lower back"],"f":"goodMorning","o":{"load":"band"},"nd":["bands"]},{"id":"Band_Good_Morning_Pull_Through","n":"Band Good Morning (Pull Through)","lv":0,"c":"powerlifting","m":["hamstrings"],"s":"hip","p":2,"m2":["glutes","lower back"],"f":"pullThrough","o":{"load":"band"},"nd":["bands"]},{"id":"Band_Hip_Adductions","n":"Band Hip Adductions","lv":0,"c":"strength","m":["adductors"],"s":"hipIso","p":1,"f":"legSwing","o":{"load":"band","dir":"side"},"ax":1,"nd":["bands"],"u":"side"},{"id":"Band_Pull_Apart","n":"Band Pull Apart","lv":0,"c":"strength","m":["shoulders"],"s":"rear","p":3,"m2":["middle back","traps"],"f":"pullApart","nd":["bands"]},{"id":"Band_Skull_Crusher","n":"Band Skull Crusher","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":1,"f":"skull","o":{"load":"band"},"nd":["bands","bench"]},{"id":"Barbell_Ab_Rollout","n":"Barbell Ab Rollout","lv":1,"c":"strength","m":["abdominals"],"s":"core","p":1,"m2":["lower back","shoulders"],"f":"rollout","o":{"load":"bb"},"nd":["barbell"]},{"id":"Barbell_Ab_Rollout_-_On_Knees","n":"Barbell Ab Rollout - On Knees","lv":2,"c":"strength","m":["abdominals"],"s":"core","p":1,"m2":["lower back","shoulders"],"f":"rollout","o":{"load":"bb"},"nd":["barbell"]},{"id":"Barbell_Bench_Press_-_Medium_Grip","n":"Barbell Bench Press","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":3,"a":"Barbell Bench Press - Medium Grip","m2":["shoulders","triceps"],"f":"benchPress","o":{"load":"bb","inc":"flat"},"nd":["barbell","bench"]},{"id":"Barbell_Curl","n":"Barbell Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":3,"m2":["forearms"],"f":"curl","o":{"load":"bb","pos":"stand"},"nd":["barbell"]},{"id":"Barbell_Curls_Lying_Against_An_Incline","n":"Barbell Curls Lying Against An Incline","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":1,"f":"curl","o":{"load":"bb","pos":"incline"},"nd":["barbell","bench"]},{"id":"Barbell_Deadlift","n":"Barbell Deadlift","lv":1,"c":"strength","m":["lower back"],"s":"hip","p":3,"m2":["calves","forearms","glutes","hamstrings","lats","middle back","quadriceps","traps"],"f":"deadlift","o":{"load":"bb","style":"conv"},"nd":["barbell"]},{"id":"Barbell_Full_Squat","n":"Barbell Full Squat","lv":1,"c":"strength","m":["quadriceps"],"s":"knee","p":2,"m2":["calves","glutes","hamstrings","lower back"],"f":"squat","o":{"load":"bbBack"},"nd":["barbell"]},{"id":"Barbell_Glute_Bridge","n":"Barbell Glute Bridge","lv":1,"c":"powerlifting","m":["glutes"],"s":"hip","p":2,"m2":["calves","hamstrings"],"f":"bridge","o":{"load":"bb"},"nd":["barbell"]},{"id":"Barbell_Guillotine_Bench_Press","n":"Barbell Guillotine Bench Press","lv":1,"c":"strength","m":["chest"],"s":"hpush","p":0,"m2":["shoulders","triceps"],"f":"benchPress","o":{"load":"bb","inc":"flat"},"nd":["barbell","bench"]},{"id":"Barbell_Hack_Squat","n":"Barbell Hack Squat","lv":1,"c":"strength","m":["quadriceps"],"s":"knee","p":1,"m2":["calves","forearms","hamstrings"],"f":"squat","o":{"load":"bbBack"},"ax":1,"nd":["barbell"]},{"id":"Barbell_Hip_Thrust","n":"Barbell Hip Thrust","lv":1,"c":"powerlifting","m":["glutes"],"s":"hip","p":3,"m2":["calves","hamstrings"],"f":"bridge","o":{"load":"bb","bench":1},"nd":["barbell","bench"]},{"id":"Barbell_Incline_Bench_Press_-_Medium_Grip","n":"Incline Barbell Bench Press","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":2,"a":"Barbell Incline Bench Press - Medium Grip","m2":["shoulders","triceps"],"f":"benchPress","o":{"load":"bb","inc":"incline"},"nd":["barbell","bench"]},{"id":"Barbell_Incline_Shoulder_Raise","n":"Barbell Incline Shoulder Raise","lv":0,"c":"strength","m":["shoulders"],"s":"none","p":1,"m2":["chest"],"nd":["barbell","bench"]},{"id":"Barbell_Lunge","n":"Barbell Lunge","lv":1,"c":"strength","m":["quadriceps"],"s":"knee","p":2,"m2":["calves","glutes","hamstrings"],"f":"lunge","o":{"load":"bb","mode":"forward"},"nd":["barbell"],"u":"side"},{"id":"Barbell_Rear_Delt_Row","n":"Barbell Rear Delt Row","lv":0,"c":"strength","m":["shoulders"],"s":"hpull","p":1,"m2":["biceps","lats","middle back"],"f":"bentRow","o":{"load":"bb"},"nd":["barbell"]},{"id":"Barbell_Rollout_from_Bench","n":"Barbell Rollout from Bench","lv":1,"c":"strength","m":["abdominals"],"s":"core","p":1,"m2":["glutes","hamstrings","lats","shoulders"],"f":"rollout","o":{"load":"bb"},"nd":["barbell","bench"]},{"id":"Barbell_Seated_Calf_Raise","n":"Barbell Seated Calf Raise","lv":0,"c":"strength","m":["calves"],"s":"calves","p":1,"f":"calfRaise","o":{"load":"bb","seated":1},"nd":["barbell"]},{"id":"Barbell_Shoulder_Press","n":"Barbell Shoulder Press","lv":1,"c":"strength","m":["shoulders"],"s":"vpush","p":2,"m2":["chest","triceps"],"f":"ohPress","o":{"load":"bb"},"nd":["barbell"]},{"id":"Barbell_Shrug","n":"Barbell Shrug","lv":0,"c":"strength","m":["traps"],"s":"traps","p":3,"f":"shrug","o":{"load":"bb"},"nd":["barbell"]},{"id":"Barbell_Shrug_Behind_The_Back","n":"Barbell Shrug Behind The Back","lv":0,"c":"strength","m":["traps"],"s":"traps","p":0,"m2":["forearms","middle back"],"f":"shrug","o":{"load":"bb"},"nd":["barbell"]},{"id":"Barbell_Side_Bend","n":"Barbell Side Bend","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":0,"m2":["lower back"],"f":"sideBend","o":{"load":"bb"},"nd":["barbell"],"u":"side"},{"id":"Barbell_Side_Split_Squat","n":"Barbell Side Split Squat","lv":0,"c":"strength","m":["quadriceps"],"s":"knee","p":1,"m2":["calves","hamstrings","lower back"],"f":"lunge","o":{"load":"bb"},"ax":1,"nd":["barbell"],"u":"side"},{"id":"Barbell_Squat","n":"Barbell Squat","lv":0,"c":"strength","m":["quadriceps"],"s":"knee","p":3,"m2":["calves","glutes","hamstrings","lower back"],"f":"squat","o":{"load":"bbBack"},"nd":["barbell"]},{"id":"Barbell_Squat_To_A_Bench","n":"Barbell Squat To A Bench","lv":2,"c":"strength","m":["quadriceps"],"s":"knee","p":0,"m2":["calves","glutes","hamstrings","lower back"],"f":"squat","o":{"load":"bbBack","box":1},"nd":["barbell","bench"]},{"id":"Barbell_Step_Ups","n":"Barbell Step Ups","lv":1,"c":"strength","m":["quadriceps"],"s":"knee","p":1,"m2":["calves","glutes","hamstrings","quadriceps"],"f":"stepUp","o":{"load":"bb"},"nd":["barbell","box"],"u":"side"},{"id":"Barbell_Walking_Lunge","n":"Barbell Walking Lunge","lv":0,"c":"strength","m":["quadriceps"],"s":"knee","p":1,"m2":["calves","glutes","hamstrings"],"f":"lunge","o":{"load":"bb","mode":"walk"},"nd":["barbell"],"u":"alt"},{"id":"Battling_Ropes","n":"Battling Ropes","lv":0,"c":"strength","m":["shoulders"],"s":"none","p":0,"m2":["chest","forearms"],"nd":["other"]},{"id":"Bear_Crawl_Sled_Drags","n":"Bear Crawl Sled Drags","lv":0,"c":"strongman","m":["quadriceps"],"s":"none","p":0,"m2":["calves","glutes","hamstrings"],"nd":["sled"]},{"id":"Behind_Head_Chest_Stretch","n":"Behind Head Chest Stretch","lv":2,"c":"stretching","m":["chest"],"s":"stretch","p":1,"m2":["shoulders"],"f":"stChest","ax":1},{"id":"Bench_Dips","n":"Bench Dips","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":3,"m2":["chest","shoulders"],"f":"dip","o":{"v":"bench"}},{"id":"Bench_Jump","n":"Bench Jump","lv":1,"c":"plyometrics","m":["quadriceps"],"s":"plyo","p":1,"m2":["calves","glutes","hamstrings"],"f":"boxJump","nd":["box"]},{"id":"Bench_Press_-_Powerlifting","n":"Bench Press - Powerlifting","lv":1,"c":"powerlifting","m":["triceps"],"s":"triceps","p":1,"m2":["chest","forearms","lats","shoulders"],"f":"benchPress","o":{"load":"bb","inc":"flat"},"nd":["barbell","bench"]},{"id":"Bench_Press_-_With_Bands","n":"Band Bench Press","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":1,"a":"Bench Press - With Bands","m2":["shoulders","triceps"],"f":"benchPress","o":{"load":"band","inc":"flat"},"nd":["bands","bench"]},{"id":"Bench_Press_with_Chains","n":"Bench Press with Chains","lv":2,"c":"powerlifting","m":["triceps"],"s":"triceps","p":1,"m2":["chest","lats","shoulders"],"f":"benchPress","o":{"load":"bb","inc":"flat"},"nd":["barbell","bench","rack"]},{"id":"Bench_Sprint","n":"Bench Sprint","lv":0,"c":"plyometrics","m":["quadriceps"],"s":"cardio","p":1,"m2":["calves","glutes","hamstrings"],"f":"run","ax":1,"nd":["box"]},{"id":"Bent-Arm_Barbell_Pullover","n":"Bent-Arm Barbell Pullover","lv":1,"c":"strength","m":["lats"],"s":"chestIso","p":1,"m2":["chest","lats","shoulders","triceps"],"f":"pullover","o":{"load":"bb"},"nd":["barbell","bench"]},{"id":"Bent-Arm_Dumbbell_Pullover","n":"Bent-Arm Dumbbell Pullover","lv":1,"c":"strength","m":["chest"],"s":"chestIso","p":1,"m2":["lats","shoulders","triceps"],"f":"pullover","o":{"load":"db"},"nd":["bench","dumbbell"]},{"id":"Bent-Knee_Hip_Raise","n":"Bent-Knee Hip Raise","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"legRaise"},{"id":"Bent_Over_Barbell_Row","n":"Bent Over Barbell Row","lv":0,"c":"strength","m":["middle back"],"s":"hpull","p":3,"m2":["biceps","lats","shoulders"],"f":"bentRow","o":{"load":"bb"},"nd":["barbell"]},{"id":"Bent_Over_Dumbbell_Rear_Delt_Raise_With_Head_On_Bench","n":"Bent Over Dumbbell Rear Delt Raise With Head On Bench","lv":0,"c":"strength","m":["shoulders"],"s":"rear","p":1,"f":"reverseFly","o":{"load":"db"},"nd":["bench","dumbbell"]},{"id":"Bent_Over_Low-Pulley_Side_Lateral","n":"Bent Over Low-Pulley Side Lateral","lv":0,"c":"strength","m":["shoulders"],"s":"rear","p":1,"m2":["lower back","middle back","traps"],"f":"reverseFly","o":{"load":"cable"},"nd":["cable"]},{"id":"Bent_Over_One-Arm_Long_Bar_Row","n":"Bent Over One-Arm Long Bar Row","lv":0,"c":"strength","m":["middle back"],"s":"hpull","p":1,"m2":["biceps","lats","lower back","traps"],"f":"bentRow","o":{"load":"bb"},"nd":["barbell"],"u":"side"},{"id":"Bent_Over_Two-Arm_Long_Bar_Row","n":"Bent Over Two-Arm Long Bar Row","lv":1,"c":"strength","m":["middle back"],"s":"hpull","p":1,"m2":["biceps","lats"],"f":"bentRow","o":{"load":"bb"},"nd":["barbell"]},{"id":"Bent_Over_Two-Dumbbell_Row","n":"Bent-Over Dumbbell Row","lv":0,"c":"strength","m":["middle back"],"s":"hpull","p":3,"a":"Bent Over Two-Dumbbell Row","m2":["biceps","lats","shoulders"],"f":"bentRow","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Bent_Over_Two-Dumbbell_Row_With_Palms_In","n":"Bent Over Two-Dumbbell Row With Palms In","lv":0,"c":"strength","m":["middle back"],"s":"hpull","p":1,"m2":["biceps","lats"],"f":"bentRow","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Bent_Press","n":"Bent Press","lv":2,"c":"strength","m":["abdominals"],"s":"none","p":1,"m2":["glutes","hamstrings","lower back","quadriceps","shoulders","triceps"],"nd":["kettlebell"]},{"id":"Bicycling","n":"Bicycling","lv":0,"c":"cardio","m":["quadriceps"],"s":"cardio","p":0,"m2":["calves","glutes","hamstrings"],"f":"bike","nd":["other"]},{"id":"Bicycling_Stationary","n":"Stationary Bike","lv":0,"c":"cardio","m":["quadriceps"],"s":"cardio","p":3,"a":"Bicycling, Stationary","m2":["calves","glutes","hamstrings"],"f":"bike","nd":["cardio"]},{"id":"Board_Press","n":"Board Press","lv":1,"c":"powerlifting","m":["triceps"],"s":"triceps","p":1,"m2":["chest","forearms","lats","shoulders"],"f":"benchPress","o":{"load":"bb","inc":"flat"},"nd":["barbell","bench","rack"]},{"id":"Body-Up","n":"Body-Up","lv":1,"c":"strength","m":["triceps"],"s":"triceps","p":1,"m2":["abdominals","forearms"],"f":"pushup","o":{"v":"incline"},"ax":1},{"id":"Body_Tricep_Press","n":"Body Tricep Press","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":1,"f":"pushup","o":{"v":"incline"},"ax":1},{"id":"Bodyweight_Flyes","n":"Bodyweight Flyes","lv":1,"c":"strength","m":["chest"],"s":"none","p":1,"m2":["abdominals","shoulders","triceps"],"nd":["barbell"]},{"id":"Bodyweight_Mid_Row","n":"Bodyweight Mid Row","lv":1,"c":"strength","m":["middle back"],"s":"hpull","p":1,"m2":["biceps","lats"],"f":"invRow","nd":["rack"]},{"id":"Bodyweight_Squat","n":"Bodyweight Squat","lv":0,"c":"strength","m":["quadriceps"],"s":"knee","p":3,"m2":["glutes","hamstrings"],"f":"squat"},{"id":"Bodyweight_Walking_Lunge","n":"Bodyweight Walking Lunge","lv":0,"c":"strength","m":["quadriceps"],"s":"knee","p":2,"m2":["calves","glutes","hamstrings"],"f":"lunge","o":{"mode":"walk"},"u":"alt"},{"id":"Bosu_Ball_Cable_Crunch_With_Side_Bends","n":"Bosu Ball Cable Crunch With Side Bends","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"cableCrunch","ax":1,"nd":["cable","exball"]},{"id":"Bottoms-Up_Clean_From_The_Hang_Position","n":"Bottoms-Up Clean From The Hang Position","lv":1,"c":"strength","m":["forearms"],"s":"olympic","p":1,"m2":["biceps","shoulders"],"f":"clean","o":{"load":"kb","hang":1},"nd":["kettlebell"]},{"id":"Bottoms_Up","n":"Bottoms Up","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":0,"f":"legRaise"},{"id":"Box_Jump_Multiple_Response","n":"Box Jump (Multiple Response)","lv":0,"c":"plyometrics","m":["hamstrings"],"s":"plyo","p":2,"m2":["abductors","adductors","calves","glutes","quadriceps"],"f":"boxJump","nd":["box"]},{"id":"Box_Skip","n":"Box Skip","lv":0,"c":"plyometrics","m":["hamstrings"],"s":"cardio","p":1,"m2":["abductors","adductors","calves","glutes","quadriceps"],"f":"run","ax":1,"nd":["box"]},{"id":"Box_Squat","n":"Box Squat","lv":1,"c":"powerlifting","m":["quadriceps"],"s":"knee","p":1,"m2":["adductors","calves","glutes","hamstrings","lower back"],"f":"squat","o":{"load":"bbBack","box":1},"nd":["barbell","box"]},{"id":"Box_Squat_with_Bands","n":"Box Squat with Bands","lv":2,"c":"powerlifting","m":["quadriceps"],"s":"knee","p":1,"m2":["abductors","adductors","calves","glutes","hamstrings","lower back"],"f":"squat","o":{"load":"bbBack","box":1},"nd":["bands","barbell","box"]},{"id":"Box_Squat_with_Chains","n":"Box Squat with Chains","lv":2,"c":"strength","m":["quadriceps"],"s":"knee","p":1,"m2":["abductors","adductors","calves","glutes","hamstrings","lower back"],"f":"squat","o":{"load":"bbBack","box":1},"nd":["barbell","box","rack"]},{"id":"Brachialis-SMR","n":"Brachialis-SMR","lv":1,"c":"stretching","m":["biceps"],"s":"stretch","p":1,"f":"smr","o":{"pos":"side"},"nd":["foamroll"]},{"id":"Bradford_Rocky_Presses","n":"Bradford/Rocky Presses","lv":0,"c":"strength","m":["shoulders"],"s":"vpush","p":0,"m2":["triceps"],"f":"ohPress","o":{"load":"bb"},"nd":["barbell"]},{"id":"Butt-Ups","n":"Butt-Ups","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":0,"f":"plank","o":{"v":"full"},"ax":1},{"id":"Butt_Lift_Bridge","n":"Glute Bridge","lv":0,"c":"strength","m":["glutes"],"s":"hip","p":3,"a":"Butt Lift (Bridge)","m2":["hamstrings"],"f":"bridge"},{"id":"Butterfly","n":"Butterfly","lv":0,"c":"strength","m":["chest"],"s":"chestIso","p":3,"f":"fly","o":{"pos":"seat","load":"machine"},"nd":["machine"]},{"id":"Cable_Chest_Press","n":"Cable Chest Press","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["shoulders","triceps"],"f":"benchPress","o":{"load":"cable","inc":"flat"},"nd":["bench","cable"]},{"id":"Cable_Crossover","n":"Cable Crossover","lv":0,"c":"strength","m":["chest"],"s":"chestIso","p":3,"m2":["shoulders"],"f":"fly","o":{"load":"cable","pos":"stand"},"nd":["cable"]},{"id":"Cable_Crunch","n":"Cable Crunch","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":3,"f":"cableCrunch","nd":["cable"]},{"id":"Cable_Deadlifts","n":"Cable Deadlifts","lv":0,"c":"strength","m":["quadriceps"],"s":"hip","p":1,"m2":["forearms","glutes","hamstrings","lower back"],"f":"deadlift","o":{"load":"cable","style":"conv"},"nd":["cable"]},{"id":"Cable_Hammer_Curls_-_Rope_Attachment","n":"Cable Hammer Curls - Rope Attachment","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":2,"f":"curl","o":{"load":"cable","pos":"stand"},"nd":["cable"]},{"id":"Cable_Hip_Adduction","n":"Cable Hip Adduction","lv":0,"c":"strength","m":["quadriceps"],"s":"hipIso","p":1,"f":"legSwing","o":{"load":"cable","dir":"side"},"ax":1,"nd":["cable"],"u":"side"},{"id":"Cable_Incline_Pushdown","n":"Cable Incline Pushdown","lv":0,"c":"strength","m":["lats"],"s":"vpull","p":1,"f":"armPulldown","o":{"load":"cable"},"ax":1,"nd":["bench","cable"]},{"id":"Cable_Incline_Triceps_Extension","n":"Cable Incline Triceps Extension","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":1,"f":"overTri","o":{"load":"cable"},"ax":1,"nd":["bench","cable"]},{"id":"Cable_Internal_Rotation","n":"Cable Internal Rotation","lv":0,"c":"strength","m":["shoulders"],"s":"rear","p":1,"f":"rotation","o":{"load":"cable","inward":1},"nd":["cable"],"u":"side"},{"id":"Cable_Iron_Cross","n":"Cable Iron Cross","lv":0,"c":"strength","m":["chest"],"s":"chestIso","p":1,"f":"fly","o":{"load":"cable","pos":"stand"},"nd":["cable"]},{"id":"Cable_Judo_Flip","n":"Cable Judo Flip","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"twist","o":{"load":"cable"},"ax":1,"nd":["cable"]},{"id":"Cable_Lying_Triceps_Extension","n":"Cable Lying Triceps Extension","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":1,"f":"skull","o":{"load":"cable"},"nd":["bench","cable"]},{"id":"Cable_One_Arm_Tricep_Extension","n":"Cable One Arm Tricep Extension","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":1,"f":"overTri","o":{"load":"cable"},"ax":1,"nd":["cable"],"u":"side"},{"id":"Cable_Preacher_Curl","n":"Cable Preacher Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":1,"m2":["forearms"],"f":"curl","o":{"load":"cable","pos":"preacher"},"nd":["cable","machine"]},{"id":"Cable_Rear_Delt_Fly","n":"Cable Rear Delt Fly","lv":0,"c":"strength","m":["shoulders"],"s":"rear","p":2,"f":"reverseFly","o":{"load":"cable"},"nd":["cable"]},{"id":"Cable_Reverse_Crunch","n":"Cable Reverse Crunch","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"legRaise","nd":["cable"]},{"id":"Cable_Rope_Overhead_Triceps_Extension","n":"Cable Rope Overhead Triceps Extension","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":2,"f":"overTri","o":{"load":"cable"},"nd":["cable"]},{"id":"Cable_Rope_Rear-Delt_Rows","n":"Cable Rope Rear-Delt Rows","lv":0,"c":"strength","m":["shoulders"],"s":"rear","p":1,"m2":["biceps","middle back"],"f":"facePull","o":{"load":"cable"},"nd":["cable"]},{"id":"Cable_Russian_Twists","n":"Cable Russian Twists","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"twist","o":{"load":"cable"},"nd":["cable"]},{"id":"Cable_Seated_Crunch","n":"Cable Seated Crunch","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"cableCrunch","nd":["cable"]},{"id":"Cable_Seated_Lateral_Raise","n":"Cable Seated Lateral Raise","lv":0,"c":"strength","m":["shoulders"],"s":"delts","p":1,"m2":["middle back","traps"],"f":"lateralRaise","o":{"load":"cable"},"nd":["cable"]},{"id":"Cable_Shoulder_Press","n":"Cable Shoulder Press","lv":0,"c":"strength","m":["shoulders"],"s":"vpush","p":1,"m2":["triceps"],"f":"ohPress","o":{"load":"cable"},"nd":["cable"]},{"id":"Cable_Shrugs","n":"Cable Shrugs","lv":0,"c":"strength","m":["traps"],"s":"traps","p":1,"f":"shrug","o":{"load":"cable"},"nd":["cable"]},{"id":"Cable_Wrist_Curl","n":"Cable Wrist Curl","lv":0,"c":"strength","m":["forearms"],"s":"forearms","p":1,"f":"wristCurl","o":{"load":"cable"},"nd":["cable"]},{"id":"Calf-Machine_Shoulder_Shrug","n":"Calf-Machine Shoulder Shrug","lv":0,"c":"strength","m":["traps"],"s":"traps","p":0,"f":"shrug","o":{"load":"bb"},"nd":["machine"]},{"id":"Calf_Press","n":"Calf Press","lv":0,"c":"strength","m":["calves"],"s":"calves","p":1,"f":"calfRaise","o":{"load":"machine","seated":1},"nd":["machine"]},{"id":"Calf_Press_On_The_Leg_Press_Machine","n":"Calf Press On The Leg Press Machine","lv":0,"c":"strength","m":["calves"],"s":"calves","p":2,"f":"calfRaise","o":{"load":"machine","seated":1},"nd":["machine"]},{"id":"Calf_Raise_On_A_Dumbbell","n":"Calf Raise On A Dumbbell","lv":1,"c":"strength","m":["calves"],"s":"calves","p":1,"f":"calfRaise","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Calf_Raises_-_With_Bands","n":"Band Calf Raise","lv":0,"c":"strength","m":["calves"],"s":"calves","p":2,"a":"Calf Raises - With Bands","f":"calfRaise","o":{"load":"band"},"nd":["bands"]},{"id":"Calf_Stretch_Elbows_Against_Wall","n":"Calf Stretch Elbows Against Wall","lv":0,"c":"stretching","m":["calves"],"s":"stretch","p":1,"f":"calf","u":"side"},{"id":"Calf_Stretch_Hands_Against_Wall","n":"Wall Calf Stretch","lv":0,"c":"stretching","m":["calves"],"s":"stretch","p":3,"a":"Calf Stretch Hands Against Wall","f":"calf","u":"side"},{"id":"Calves-SMR","n":"Calves-SMR","lv":1,"c":"stretching","m":["calves"],"s":"stretch","p":1,"f":"smr","o":{"pos":"seated"},"nd":["foamroll"]},{"id":"Car_Deadlift","n":"Car Deadlift","lv":1,"c":"strongman","m":["quadriceps"],"s":"none","p":0,"m2":["forearms","glutes","hamstrings","lower back","traps"],"nd":["other"]},{"id":"Car_Drivers","n":"Car Drivers","lv":0,"c":"strength","m":["shoulders"],"s":"none","p":1,"m2":["forearms"],"nd":["barbell"]},{"id":"Carioca_Quick_Step","n":"Carioca Quick Step","lv":0,"c":"plyometrics","m":["adductors"],"s":"plyo","p":1,"m2":["abdominals","abductors","calves","glutes","hamstrings","quadriceps"],"f":"lateralHop"},{"id":"Cat_Stretch","n":"Cat-Cow Stretch","lv":0,"c":"stretching","m":["lower back"],"s":"stretch","p":3,"a":"Cat Stretch","m2":["middle back","traps"],"f":"stCat"},{"id":"Catch_and_Overhead_Throw","n":"Catch and Overhead Throw","lv":0,"c":"plyometrics","m":["lats"],"s":"plyo","p":1,"m2":["abdominals","chest","shoulders"],"f":"ballSlam","ax":1,"nd":["medball"]},{"id":"Chain_Handle_Extension","n":"Chain Handle Extension","lv":1,"c":"powerlifting","m":["triceps"],"s":"none","p":0,"nd":["other"]},{"id":"Chain_Press","n":"Chain Press","lv":1,"c":"powerlifting","m":["chest"],"s":"hpush","p":0,"m2":["shoulders","triceps"],"f":"benchPress","o":{"load":"db","inc":"floor"},"ax":1,"nd":["other"]},{"id":"Chair_Leg_Extended_Stretch","n":"Chair Leg Extended Stretch","lv":0,"c":"stretching","m":["hamstrings"],"s":"stretch","p":1,"m2":["adductors"],"f":"stSeatReach","o":{"chair":1},"u":"side"},{"id":"Chair_Lower_Back_Stretch","n":"Chair Lower Back Stretch","lv":0,"c":"stretching","m":["lats"],"s":"stretch","p":2,"m2":["lower back"],"f":"stSeatFold"},{"id":"Chair_Squat","n":"Chair Squat","lv":0,"c":"strength","m":["quadriceps"],"s":"knee","p":0,"m2":["calves","glutes","hamstrings"],"f":"squat","o":{"load":"bbBack","box":1},"nd":["machine"]},{"id":"Chair_Upper_Body_Stretch","n":"Chair Upper Body Stretch","lv":0,"c":"stretching","m":["shoulders"],"s":"stretch","p":1,"m2":["biceps","chest"],"f":"stReach","ax":1},{"id":"Chest_And_Front_Of_Shoulder_Stretch","n":"Chest and Shoulder Stretch","lv":0,"c":"stretching","m":["chest"],"s":"stretch","p":3,"a":"Chest And Front Of Shoulder Stretch","m2":["shoulders"],"f":"stChest"},{"id":"Chest_Push_from_3_point_stance","n":"Chest Push from 3 point stance","lv":0,"c":"plyometrics","m":["chest"],"s":"plyo","p":1,"m2":["abdominals","shoulders","triceps"],"f":"chestPass","nd":["medball"]},{"id":"Chest_Push_multiple_response","n":"Chest Push (multiple response)","lv":0,"c":"plyometrics","m":["chest"],"s":"plyo","p":1,"m2":["abdominals","shoulders","triceps"],"f":"chestPass","nd":["medball"]},{"id":"Chest_Push_single_response","n":"Chest Push (single response)","lv":0,"c":"plyometrics","m":["chest"],"s":"plyo","p":1,"m2":["abdominals","shoulders","triceps"],"f":"chestPass","nd":["medball"]},{"id":"Chest_Push_with_Run_Release","n":"Chest Push with Run Release","lv":0,"c":"plyometrics","m":["chest"],"s":"plyo","p":1,"m2":["abdominals","shoulders","triceps"],"f":"chestPass","nd":["medball"]},{"id":"Chest_Stretch_on_Stability_Ball","n":"Chest Stretch on Stability Ball","lv":0,"c":"stretching","m":["chest"],"s":"stretch","p":1,"f":"stChest","ax":1,"nd":["exball"]},{"id":"Childs_Pose","n":"Child's Pose","lv":0,"c":"stretching","m":["lower back"],"s":"stretch","p":3,"m2":["glutes","middle back"],"f":"stChild"},{"id":"Chin-Up","n":"Chin-Up","lv":0,"c":"strength","m":["lats"],"s":"vpull","p":3,"m2":["biceps","forearms","middle back"],"f":"pullUp","nd":["pullupbar"]},{"id":"Chin_To_Chest_Stretch","n":"Chin To Chest Stretch","lv":0,"c":"stretching","m":["neck"],"s":"stretch","p":2,"m2":["traps"],"f":"stNeck","o":{"fwd":1}},{"id":"Circus_Bell","n":"Circus Bell","lv":2,"c":"strongman","m":["shoulders"],"s":"vpush","p":0,"m2":["forearms","glutes","hamstrings","lower back","traps","triceps"],"f":"ohPress","o":{"load":"bb"},"ax":1,"nd":["other"]},{"id":"Clean","n":"Clean","lv":1,"c":"olympic weightlifting","m":["hamstrings"],"s":"olympic","p":1,"m2":["calves","forearms","glutes","lower back","quadriceps","shoulders","traps"],"f":"clean","o":{"load":"bb"},"nd":["barbell"]},{"id":"Clean_Deadlift","n":"Clean Deadlift","lv":0,"c":"olympic weightlifting","m":["hamstrings"],"s":"hip","p":0,"m2":["forearms","glutes","lower back","middle back","quadriceps","traps"],"f":"deadlift","o":{"load":"bb","style":"conv"},"nd":["barbell"]},{"id":"Clean_Pull","n":"Clean Pull","lv":1,"c":"olympic weightlifting","m":["quadriceps"],"s":"olympic","p":1,"m2":["forearms","glutes","hamstrings","lower back","traps"],"f":"highPull","o":{"load":"bb"},"nd":["barbell"]},{"id":"Clean_Shrug","n":"Clean Shrug","lv":0,"c":"olympic weightlifting","m":["traps"],"s":"traps","p":0,"m2":["forearms","shoulders"],"f":"shrug","o":{"load":"bb"},"nd":["barbell"]},{"id":"Clean_and_Jerk","n":"Clean and Jerk","lv":2,"c":"olympic weightlifting","m":["shoulders"],"s":"olympic","p":1,"m2":["abdominals","glutes","hamstrings","lower back","quadriceps","traps","triceps"],"f":"clean","o":{"load":"bb","jerk":1},"nd":["barbell"]},{"id":"Clean_and_Press","n":"Clean and Press","lv":1,"c":"strength","m":["shoulders"],"s":"olympic","p":1,"m2":["abdominals","calves","glutes","hamstrings","lower back","middle back","quadriceps","shoulders","traps","triceps"],"f":"clean","o":{"load":"bb","jerk":1},"ax":1,"nd":["barbell"]},{"id":"Clean_from_Blocks","n":"Clean from Blocks","lv":1,"c":"olympic weightlifting","m":["quadriceps"],"s":"olympic","p":1,"m2":["calves","glutes","hamstrings","shoulders","traps"],"f":"clean","o":{"load":"bb","hang":1},"nd":["barbell","rack"]},{"id":"Clock_Push-Up","n":"Clock Push-Up","lv":1,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["shoulders","triceps"],"f":"pushup","o":{"v":"full"},"ax":1},{"id":"Close-Grip_Barbell_Bench_Press","n":"Close-Grip Barbell Bench Press","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":2,"m2":["chest","shoulders"],"f":"benchPress","o":{"load":"bb","inc":"flat"},"nd":["barbell","bench"]},{"id":"Close-Grip_Dumbbell_Press","n":"Close-Grip Dumbbell Press","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":1,"m2":["chest","shoulders"],"f":"benchPress","o":{"load":"db","inc":"flat"},"nd":["bench","dumbbell"]},{"id":"Close-Grip_EZ-Bar_Curl_with_Band","n":"Close-Grip EZ-Bar Curl with Band","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":1,"m2":["forearms"],"f":"curl","o":{"load":"bb","pos":"stand"},"nd":["bands","barbell"]},{"id":"Close-Grip_EZ-Bar_Press","n":"Close-Grip EZ-Bar Press","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":1,"m2":["chest","shoulders"],"f":"benchPress","o":{"load":"bb","inc":"flat"},"nd":["barbell","bench"]},{"id":"Close-Grip_EZ_Bar_Curl","n":"Close-Grip EZ Bar Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":1,"m2":["forearms"],"f":"curl","o":{"load":"bb","pos":"stand"},"nd":["barbell"]},{"id":"Close-Grip_Front_Lat_Pulldown","n":"Close-Grip Front Lat Pulldown","lv":0,"c":"strength","m":["lats"],"s":"vpull","p":2,"m2":["biceps","middle back","shoulders"],"f":"pulldown","nd":["cable"]},{"id":"Close-Grip_Push-Up_off_of_a_Dumbbell","n":"Close-Grip Push-Up off of a Dumbbell","lv":1,"c":"strength","m":["triceps"],"s":"triceps","p":0,"m2":["abdominals","chest","shoulders"],"f":"pushup","o":{"v":"full"}},{"id":"Close-Grip_Standing_Barbell_Curl","n":"Close-Grip Standing Barbell Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":1,"m2":["forearms"],"f":"curl","o":{"load":"bb","pos":"stand"},"nd":["barbell"]},{"id":"Cocoons","n":"Cocoons","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"vup"},{"id":"Conans_Wheel","n":"Conan's Wheel","lv":1,"c":"strongman","m":["quadriceps"],"s":"none","p":0,"m2":["abdominals","biceps","calves","forearms","lower back","shoulders","traps"],"nd":["other"]},{"id":"Concentration_Curls","n":"Concentration Curls","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":2,"m2":["forearms"],"f":"curl","o":{"load":"db","pos":"conc"},"nd":["dumbbell"]},{"id":"Cross-Body_Crunch","n":"Cross-Body Crunch","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":2,"f":"crunch"},{"id":"Cross_Body_Hammer_Curl","n":"Cross Body Hammer Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":1,"m2":["forearms"],"f":"curl","o":{"load":"db","pos":"stand"},"nd":["dumbbell"]},{"id":"Cross_Over_-_With_Bands","n":"Band Chest Crossover","lv":0,"c":"strength","m":["chest"],"s":"chestIso","p":2,"a":"Cross Over - With Bands","m2":["biceps","shoulders"],"f":"fly","o":{"load":"band","pos":"stand"},"nd":["bands"]},{"id":"Crossover_Reverse_Lunge","n":"Crossover Reverse Lunge","lv":1,"c":"stretching","m":["lower back"],"s":"stretch","p":1,"m2":["abdominals","abductors","glutes","hamstrings","quadriceps"],"f":"stHipFlexor","ax":1,"u":"side"},{"id":"Crucifix","n":"Crucifix","lv":0,"c":"strongman","m":["shoulders"],"s":"delts","p":0,"m2":["forearms"],"f":"lateralRaise","o":{"load":"db"},"ax":1,"nd":["other"]},{"id":"Crunch_-_Hands_Overhead","n":"Crunch - Hands Overhead","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"crunch"},{"id":"Crunch_-_Legs_On_Exercise_Ball","n":"Crunch - Legs On Exercise Ball","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"crunch","nd":["exball"]},{"id":"Crunches","n":"Crunch","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":3,"a":"Crunches","f":"crunch"},{"id":"Cuban_Press","n":"Cuban Press","lv":1,"c":"strength","m":["shoulders"],"s":"none","p":1,"m2":["traps"],"nd":["dumbbell"]},{"id":"Dancers_Stretch","n":"Dancer's Stretch","lv":0,"c":"stretching","m":["lower back"],"s":"stretch","p":1,"m2":["abductors","glutes"],"f":"stSeatTwist","u":"side"},{"id":"Dead_Bug","n":"Dead Bug","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":3,"f":"deadbug"},{"id":"Deadlift_with_Bands","n":"Deadlift with Bands","lv":2,"c":"powerlifting","m":["lower back"],"s":"hip","p":1,"m2":["forearms","glutes","hamstrings","middle back","quadriceps","traps"],"f":"deadlift","o":{"load":"bb","style":"conv"},"nd":["bands","barbell"]},{"id":"Deadlift_with_Chains","n":"Deadlift with Chains","lv":2,"c":"powerlifting","m":["lower back"],"s":"hip","p":1,"m2":["forearms","glutes","hamstrings","middle back","quadriceps","traps"],"f":"deadlift","o":{"load":"bb","style":"conv"},"nd":["barbell","rack"]},{"id":"Decline_Barbell_Bench_Press","n":"Decline Barbell Bench Press","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["shoulders","triceps"],"f":"benchPress","o":{"load":"bb","inc":"decline"},"nd":["barbell","bench"]},{"id":"Decline_Close-Grip_Bench_To_Skull_Crusher","n":"Decline Close-Grip Bench To Skull Crusher","lv":1,"c":"strength","m":["triceps"],"s":"triceps","p":1,"m2":["chest","shoulders"],"f":"skull","o":{"load":"bb"},"nd":["barbell","bench"]},{"id":"Decline_Crunch","n":"Decline Crunch","lv":1,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"crunch","nd":["bench"]},{"id":"Decline_Dumbbell_Bench_Press","n":"Decline Dumbbell Bench Press","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["shoulders","triceps"],"f":"benchPress","o":{"load":"db","inc":"decline"},"nd":["bench","dumbbell"]},{"id":"Decline_Dumbbell_Flyes","n":"Decline Dumbbell Flyes","lv":0,"c":"strength","m":["chest"],"s":"chestIso","p":1,"f":"fly","o":{"load":"db","pos":"lying"},"nd":["bench","dumbbell"]},{"id":"Decline_Dumbbell_Triceps_Extension","n":"Decline Dumbbell Triceps Extension","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":1,"f":"skull","o":{"load":"db"},"nd":["bench","dumbbell"]},{"id":"Decline_EZ_Bar_Triceps_Extension","n":"Decline EZ Bar Triceps Extension","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":1,"f":"skull","o":{"load":"bb"},"nd":["barbell","bench"]},{"id":"Decline_Oblique_Crunch","n":"Decline Oblique Crunch","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"crunch","nd":["bench"]},{"id":"Decline_Push-Up","n":"Decline Push-Up","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":2,"m2":["shoulders","triceps"],"f":"pushup","o":{"v":"decline"}},{"id":"Decline_Reverse_Crunch","n":"Decline Reverse Crunch","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"legRaise","nd":["bench"]},{"id":"Decline_Smith_Press","n":"Decline Smith Press","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["shoulders","triceps"],"f":"benchPress","o":{"load":"bb","inc":"decline"},"nd":["bench","machine"]},{"id":"Deficit_Deadlift","n":"Deficit Deadlift","lv":1,"c":"powerlifting","m":["lower back"],"s":"hip","p":0,"m2":["forearms","glutes","hamstrings","middle back","quadriceps","traps"],"f":"deadlift","o":{"load":"bb","style":"conv"},"nd":["barbell"]},{"id":"Depth_Jump_Leap","n":"Depth Jump Leap","lv":0,"c":"plyometrics","m":["quadriceps"],"s":"plyo","p":1,"m2":["abductors","adductors","calves","glutes","hamstrings"],"f":"boxJump","ax":1,"nd":["box"]},{"id":"Dip_Machine","n":"Dip Machine","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":1,"m2":["chest","shoulders"],"f":"dip","o":{"v":"bars"},"ax":1,"nd":["machine"]},{"id":"Dips_-_Chest_Version","n":"Chest Dip","lv":1,"c":"strength","m":["chest"],"s":"hpush","p":2,"a":"Dips - Chest Version","m2":["shoulders","triceps"],"f":"dip","o":{"v":"bars"},"nd":["dipbars"]},{"id":"Dips_-_Triceps_Version","n":"Triceps Dip","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":3,"a":"Dips - Triceps Version","m2":["chest","shoulders"],"f":"dip","o":{"v":"bars"},"nd":["dipbars"]},{"id":"Donkey_Calf_Raises","n":"Donkey Calf Raises","lv":1,"c":"strength","m":["calves"],"s":"calves","p":0,"f":"calfRaise","nd":["other"]},{"id":"Double_Kettlebell_Alternating_Hang_Clean","n":"Double Kettlebell Alternating Hang Clean","lv":1,"c":"strength","m":["hamstrings"],"s":"olympic","p":1,"m2":["biceps","calves","forearms","glutes","lower back","quadriceps","traps"],"f":"clean","o":{"load":"kb","hang":1},"nd":["kettlebell"],"u":"alt"},{"id":"Double_Kettlebell_Jerk","n":"Double Kettlebell Jerk","lv":1,"c":"strength","m":["shoulders"],"s":"olympic","p":1,"m2":["calves","quadriceps","triceps"],"f":"jerk","o":{"load":"kb"},"nd":["kettlebell"]},{"id":"Double_Kettlebell_Push_Press","n":"Double Kettlebell Push Press","lv":1,"c":"strength","m":["shoulders"],"s":"vpush","p":1,"m2":["calves","quadriceps","triceps"],"f":"ohPress","o":{"load":"kb"},"ax":1,"nd":["kettlebell"]},{"id":"Double_Kettlebell_Snatch","n":"Double Kettlebell Snatch","lv":2,"c":"strength","m":["shoulders"],"s":"olympic","p":1,"m2":["glutes","hamstrings","quadriceps"],"f":"snatch","o":{"load":"kb"},"nd":["kettlebell"]},{"id":"Double_Kettlebell_Windmill","n":"Double Kettlebell Windmill","lv":1,"c":"strength","m":["abdominals"],"s":"core","p":1,"m2":["glutes","hamstrings","shoulders","triceps"],"f":"sideBend","o":{"load":"kb"},"ax":1,"nd":["kettlebell"],"u":"side"},{"id":"Double_Leg_Butt_Kick","n":"Double Leg Butt Kick","lv":0,"c":"plyometrics","m":["quadriceps"],"s":"plyo","p":1,"m2":["abductors","adductors","calves","glutes","hamstrings"],"f":"jump"},{"id":"Downward_Facing_Balance","n":"Downward Facing Balance","lv":1,"c":"strength","m":["glutes"],"s":"none","p":1,"m2":["abdominals","hamstrings"],"nd":["exball"]},{"id":"Drag_Curl","n":"Drag Curl","lv":1,"c":"strength","m":["biceps"],"s":"biceps","p":1,"m2":["forearms"],"f":"curl","o":{"load":"bb","pos":"stand"},"nd":["barbell"]},{"id":"Drop_Push","n":"Drop Push","lv":1,"c":"plyometrics","m":["chest"],"s":"hpush","p":0,"m2":["shoulders","triceps"],"f":"pushup","ax":1,"nd":["other"]},{"id":"Dumbbell_Alternate_Bicep_Curl","n":"Dumbbell Alternate Bicep Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":2,"m2":["forearms"],"f":"curl","o":{"load":"db","pos":"stand"},"nd":["dumbbell"],"u":"alt"},{"id":"Dumbbell_Bench_Press","n":"Dumbbell Bench Press","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":3,"m2":["shoulders","triceps"],"f":"benchPress","o":{"load":"db","inc":"flat"},"nd":["bench","dumbbell"]},{"id":"Dumbbell_Bench_Press_with_Neutral_Grip","n":"Dumbbell Bench Press with Neutral Grip","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["shoulders","triceps"],"f":"benchPress","o":{"load":"db","inc":"flat"},"nd":["bench","dumbbell"]},{"id":"Dumbbell_Bicep_Curl","n":"Dumbbell Bicep Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":3,"m2":["forearms"],"f":"curl","o":{"load":"db","pos":"stand"},"nd":["dumbbell"]},{"id":"Dumbbell_Clean","n":"Dumbbell Clean","lv":1,"c":"strength","m":["hamstrings"],"s":"olympic","p":1,"m2":["calves","forearms","glutes","lower back","quadriceps","shoulders","traps"],"f":"clean","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Dumbbell_Floor_Press","n":"Dumbbell Floor Press","lv":1,"c":"powerlifting","m":["triceps"],"s":"triceps","p":3,"m2":["chest","shoulders"],"f":"benchPress","o":{"load":"db","inc":"floor"},"nd":["dumbbell"]},{"id":"Dumbbell_Flyes","n":"Dumbbell Fly","lv":0,"c":"strength","m":["chest"],"s":"chestIso","p":3,"a":"Dumbbell Flyes","f":"fly","o":{"load":"db","pos":"lying"},"nd":["bench","dumbbell"]},{"id":"Dumbbell_Incline_Row","n":"Dumbbell Incline Row","lv":0,"c":"strength","m":["middle back"],"s":"hpull","p":2,"m2":["biceps","forearms","lats","shoulders"],"f":"bentRow","o":{"load":"db","bench":1},"ax":1,"nd":["bench","dumbbell"]},{"id":"Dumbbell_Incline_Shoulder_Raise","n":"Dumbbell Incline Shoulder Raise","lv":0,"c":"strength","m":["shoulders"],"s":"none","p":1,"m2":["triceps"],"nd":["bench","dumbbell"]},{"id":"Dumbbell_Lunges","n":"Dumbbell Lunge","lv":0,"c":"strength","m":["quadriceps"],"s":"knee","p":3,"a":"Dumbbell Lunges","m2":["calves","glutes","hamstrings"],"f":"lunge","o":{"load":"db","mode":"forward"},"nd":["dumbbell"],"u":"side"},{"id":"Dumbbell_Lying_One-Arm_Rear_Lateral_Raise","n":"Dumbbell Lying One-Arm Rear Lateral Raise","lv":1,"c":"strength","m":["shoulders"],"s":"rear","p":1,"m2":["middle back"],"f":"reverseFly","o":{"load":"db"},"ax":1,"nd":["dumbbell"],"u":"side"},{"id":"Dumbbell_Lying_Pronation","n":"Dumbbell Lying Pronation","lv":1,"c":"strength","m":["forearms"],"s":"none","p":1,"nd":["dumbbell"]},{"id":"Dumbbell_Lying_Rear_Lateral_Raise","n":"Dumbbell Lying Rear Lateral Raise","lv":1,"c":"strength","m":["shoulders"],"s":"rear","p":1,"f":"reverseFly","o":{"load":"db"},"ax":1,"nd":["dumbbell"]},{"id":"Dumbbell_Lying_Supination","n":"Dumbbell Lying Supination","lv":1,"c":"strength","m":["forearms"],"s":"none","p":1,"nd":["dumbbell"]},{"id":"Dumbbell_One-Arm_Shoulder_Press","n":"Dumbbell One-Arm Shoulder Press","lv":1,"c":"strength","m":["shoulders"],"s":"vpush","p":1,"m2":["triceps"],"f":"ohPress","o":{"load":"db"},"nd":["dumbbell"],"u":"side"},{"id":"Dumbbell_One-Arm_Triceps_Extension","n":"Dumbbell One-Arm Triceps Extension","lv":1,"c":"strength","m":["triceps"],"s":"triceps","p":1,"f":"overTri","o":{"load":"db"},"nd":["dumbbell"],"u":"side"},{"id":"Dumbbell_One-Arm_Upright_Row","n":"Dumbbell One-Arm Upright Row","lv":1,"c":"strength","m":["shoulders"],"s":"delts","p":1,"m2":["biceps","traps"],"f":"uprightRow","o":{"load":"db"},"nd":["dumbbell"],"u":"side"},{"id":"Dumbbell_Prone_Incline_Curl","n":"Dumbbell Prone Incline Curl","lv":1,"c":"strength","m":["biceps"],"s":"biceps","p":1,"f":"curl","o":{"load":"db","pos":"incline"},"ax":1,"nd":["bench","dumbbell"]},{"id":"Dumbbell_Raise","n":"Dumbbell Raise","lv":0,"c":"strength","m":["shoulders"],"s":"delts","p":1,"m2":["biceps"],"f":"uprightRow","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Dumbbell_Rear_Lunge","n":"Dumbbell Rear Lunge","lv":1,"c":"strength","m":["quadriceps"],"s":"knee","p":3,"m2":["calves","glutes","hamstrings"],"f":"lunge","o":{"load":"db","mode":"reverse"},"nd":["dumbbell"],"u":"side"},{"id":"Dumbbell_Scaption","n":"Dumbbell Scaption","lv":0,"c":"strength","m":["shoulders"],"s":"delts","p":1,"m2":["traps"],"f":"lateralRaise","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Dumbbell_Seated_Box_Jump","n":"Dumbbell Seated Box Jump","lv":1,"c":"plyometrics","m":["quadriceps"],"s":"plyo","p":1,"m2":["calves","glutes","hamstrings"],"f":"boxJump","nd":["box","dumbbell"]},{"id":"Dumbbell_Seated_One-Leg_Calf_Raise","n":"Dumbbell Seated One-Leg Calf Raise","lv":0,"c":"strength","m":["calves"],"s":"calves","p":1,"f":"calfRaise","o":{"load":"db","seated":1},"nd":["dumbbell"],"u":"side"},{"id":"Dumbbell_Shoulder_Press","n":"Dumbbell Shoulder Press","lv":1,"c":"strength","m":["shoulders"],"s":"vpush","p":3,"m2":["triceps"],"f":"ohPress","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Dumbbell_Shrug","n":"Dumbbell Shrug","lv":0,"c":"strength","m":["traps"],"s":"traps","p":3,"f":"shrug","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Dumbbell_Side_Bend","n":"Dumbbell Side Bend","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":2,"f":"sideBend","o":{"load":"db"},"nd":["dumbbell"],"u":"side"},{"id":"Dumbbell_Squat","n":"Dumbbell Squat","lv":0,"c":"strength","m":["quadriceps"],"s":"knee","p":2,"m2":["calves","glutes","hamstrings","lower back"],"f":"squat","o":{"load":"dbSides"},"nd":["dumbbell"]},{"id":"Dumbbell_Squat_To_A_Bench","n":"Dumbbell Squat To A Bench","lv":1,"c":"strength","m":["quadriceps"],"s":"knee","p":1,"m2":["calves","glutes","hamstrings","lower back"],"f":"squat","o":{"load":"dbSides","box":1},"nd":["bench","dumbbell"]},{"id":"Dumbbell_Step_Ups","n":"Dumbbell Step Ups","lv":1,"c":"strength","m":["quadriceps"],"s":"knee","p":2,"m2":["calves","glutes","hamstrings"],"f":"stepUp","o":{"load":"db"},"nd":["box","dumbbell"],"u":"side"},{"id":"Dumbbell_Tricep_Extension_-Pronated_Grip","n":"Dumbbell Tricep Extension -Pronated Grip","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":1,"f":"skull","o":{"load":"db"},"nd":["bench","dumbbell"]},{"id":"Dynamic_Back_Stretch","n":"Dynamic Back Stretch","lv":0,"c":"stretching","m":["lats"],"s":"stretch","p":1,"f":"stReach","ax":1},{"id":"Dynamic_Chest_Stretch","n":"Arm Swings","lv":0,"c":"stretching","m":["chest"],"s":"stretch","p":3,"a":"Dynamic Chest Stretch","m2":["middle back"],"f":"stChest","o":{"dyn":1}},{"id":"EZ-Bar_Curl","n":"EZ-Bar Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":2,"f":"curl","o":{"load":"bb","pos":"stand"},"nd":["barbell"]},{"id":"EZ-Bar_Skullcrusher","n":"EZ-Bar Skullcrusher","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":3,"m2":["forearms"],"f":"skull","o":{"load":"bb"},"nd":["barbell","bench"]},{"id":"Elbow_Circles","n":"Elbow Circles","lv":0,"c":"stretching","m":["shoulders"],"s":"stretch","p":1,"m2":["traps"],"f":"armCircles","ax":1},{"id":"Elbow_to_Knee","n":"Elbow to Knee","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"crunch"},{"id":"Elbows_Back","n":"Elbows Back","lv":0,"c":"stretching","m":["chest"],"s":"stretch","p":2,"m2":["shoulders"],"f":"stChest"},{"id":"Elevated_Back_Lunge","n":"Elevated Back Lunge","lv":1,"c":"strength","m":["quadriceps"],"s":"knee","p":1,"m2":["glutes","hamstrings"],"f":"lunge","o":{"load":"bb","mode":"reverse"},"nd":["barbell","box"],"u":"side"},{"id":"Elevated_Cable_Rows","n":"Elevated Cable Rows","lv":1,"c":"strength","m":["lats"],"s":"hpull","p":1,"m2":["middle back","traps"],"f":"seatedRow","o":{"load":"cable"},"nd":["cable"]},{"id":"Elliptical_Trainer","n":"Elliptical Trainer","lv":1,"c":"cardio","m":["quadriceps"],"s":"cardio","p":2,"m2":["calves","glutes","hamstrings"],"f":"walk","ax":1,"nd":["cardio"]},{"id":"Exercise_Ball_Crunch","n":"Exercise Ball Crunch","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":2,"f":"crunch","o":{"ball":1},"nd":["exball"]},{"id":"Exercise_Ball_Pull-In","n":"Exercise Ball Pull-In","lv":0,"c":"strength","m":["abdominals"],"s":"none","p":1,"nd":["exball"]},{"id":"Extended_Range_One-Arm_Kettlebell_Floor_Press","n":"Extended Range One-Arm Kettlebell Floor Press","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["shoulders","triceps"],"f":"benchPress","o":{"load":"kb","inc":"floor"},"nd":["kettlebell"],"u":"side"},{"id":"External_Rotation","n":"External Rotation","lv":0,"c":"strength","m":["shoulders"],"s":"rear","p":1,"f":"rotation","o":{"load":"db"},"ax":1,"nd":["dumbbell"],"u":"side"},{"id":"External_Rotation_with_Band","n":"External Rotation with Band","lv":0,"c":"strength","m":["shoulders"],"s":"rear","p":1,"f":"rotation","o":{"load":"band"},"nd":["bands"],"u":"side"},{"id":"External_Rotation_with_Cable","n":"External Rotation with Cable","lv":0,"c":"strength","m":["shoulders"],"s":"rear","p":1,"f":"rotation","o":{"load":"cable"},"nd":["cable"],"u":"side"},{"id":"Face_Pull","n":"Face Pull","lv":1,"c":"strength","m":["shoulders"],"s":"rear","p":3,"m2":["middle back"],"f":"facePull","o":{"load":"cable"},"nd":["cable"]},{"id":"Farmers_Walk","n":"Farmer's Walk","lv":1,"c":"strongman","m":["forearms"],"s":"carry","p":0,"m2":["abdominals","glutes","hamstrings","lower back","quadriceps","traps"],"f":"carry","nd":["other"]},{"id":"Fast_Skipping","n":"Fast Skipping","lv":0,"c":"plyometrics","m":["quadriceps"],"s":"cardio","p":1,"m2":["abductors","adductors","calves","glutes","hamstrings"],"f":"run","ax":1},{"id":"Finger_Curls","n":"Finger Curls","lv":0,"c":"strength","m":["forearms"],"s":"forearms","p":0,"f":"wristCurl","o":{"load":"bb"},"nd":["barbell"]},{"id":"Flat_Bench_Cable_Flyes","n":"Flat Bench Cable Flyes","lv":1,"c":"strength","m":["chest"],"s":"chestIso","p":1,"f":"fly","o":{"load":"cable","pos":"lying"},"nd":["bench","cable"]},{"id":"Flat_Bench_Leg_Pull-In","n":"Flat Bench Leg Pull-In","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"legRaise","nd":["bench"]},{"id":"Flat_Bench_Lying_Leg_Raise","n":"Flat Bench Lying Leg Raise","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":2,"f":"legRaise","nd":["bench"]},{"id":"Flexor_Incline_Dumbbell_Curls","n":"Flexor Incline Dumbbell Curls","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":1,"f":"curl","o":{"load":"db","pos":"incline"},"nd":["bench","dumbbell"]},{"id":"Floor_Glute-Ham_Raise","n":"Floor Glute-Ham Raise","lv":1,"c":"strength","m":["hamstrings"],"s":"hipIso","p":1,"m2":["calves","glutes"],"f":"nordic"},{"id":"Floor_Press","n":"Floor Press","lv":1,"c":"powerlifting","m":["triceps"],"s":"triceps","p":1,"m2":["chest","shoulders"],"f":"benchPress","o":{"load":"bb","inc":"floor"},"nd":["barbell"]},{"id":"Floor_Press_with_Chains","n":"Floor Press with Chains","lv":1,"c":"powerlifting","m":["triceps"],"s":"triceps","p":1,"m2":["chest","shoulders"],"f":"benchPress","o":{"load":"bb","inc":"floor"},"nd":["barbell","rack"]},{"id":"Flutter_Kicks","n":"Flutter Kicks","lv":0,"c":"strength","m":["glutes"],"s":"core","p":1,"m2":["hamstrings"],"f":"legRaise","o":{"flutter":1},"ax":1,"u":"alt"},{"id":"Foot-SMR","n":"Foot Roll with a Massage Ball","lv":1,"c":"stretching","m":["calves"],"s":"stretch","p":1,"a":"Foot-SMR","f":"ball","nd":["mball"],"u":"side"},{"id":"Forward_Drag_with_Press","n":"Forward Drag with Press","lv":1,"c":"strongman","m":["chest"],"s":"none","p":0,"m2":["calves","glutes","hamstrings","quadriceps","shoulders","triceps"],"nd":["sled"]},{"id":"Frankenstein_Squat","n":"Frankenstein Squat","lv":1,"c":"olympic weightlifting","m":["quadriceps"],"s":"knee","p":0,"m2":["abdominals","calves","glutes","hamstrings"],"f":"squat","o":{"load":"front"},"nd":["barbell"]},{"id":"Freehand_Jump_Squat","n":"Jump Squat","lv":1,"c":"strength","m":["quadriceps"],"s":"plyo","p":3,"a":"Freehand Jump Squat","m2":["calves","glutes","hamstrings"],"f":"jump"},{"id":"Frog_Hops","n":"Frog Hops","lv":1,"c":"stretching","m":["quadriceps"],"s":"plyo","p":0,"m2":["calves","glutes","hamstrings"],"f":"jump","ax":1},{"id":"Frog_Sit-Ups","n":"Frog Sit-Ups","lv":1,"c":"strength","m":["abdominals"],"s":"core","p":0,"f":"situp"},{"id":"Front_Barbell_Squat","n":"Front Barbell Squat","lv":2,"c":"strength","m":["quadriceps"],"s":"knee","p":2,"m2":["calves","glutes","hamstrings"],"f":"squat","o":{"load":"front"},"nd":["barbell"]},{"id":"Front_Barbell_Squat_To_A_Bench","n":"Front Barbell Squat To A Bench","lv":2,"c":"strength","m":["quadriceps"],"s":"knee","p":1,"m2":["calves","glutes","hamstrings"],"f":"squat","o":{"load":"front","box":1},"nd":["barbell","bench"]},{"id":"Front_Box_Jump","n":"Front Box Jump","lv":0,"c":"plyometrics","m":["hamstrings"],"s":"plyo","p":2,"m2":["abductors","adductors","calves","glutes","quadriceps"],"f":"boxJump","nd":["box"]},{"id":"Front_Cable_Raise","n":"Front Cable Raise","lv":0,"c":"strength","m":["shoulders"],"s":"delts","p":1,"f":"frontRaise","o":{"load":"cable"},"nd":["cable"]},{"id":"Front_Cone_Hops_or_hurdle_hops","n":"Front Cone Hops (or hurdle hops)","lv":0,"c":"plyometrics","m":["quadriceps"],"s":"plyo","p":0,"m2":["abductors","adductors","calves","glutes","hamstrings"],"f":"jump","ax":1,"nd":["other"]},{"id":"Front_Dumbbell_Raise","n":"Front Dumbbell Raise","lv":0,"c":"strength","m":["shoulders"],"s":"delts","p":2,"f":"frontRaise","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Front_Incline_Dumbbell_Raise","n":"Front Incline Dumbbell Raise","lv":0,"c":"strength","m":["shoulders"],"s":"delts","p":1,"f":"frontRaise","o":{"load":"db"},"ax":1,"nd":["bench","dumbbell"]},{"id":"Front_Leg_Raises","n":"Front Leg Swings","lv":0,"c":"stretching","m":["hamstrings"],"s":"stretch","p":3,"a":"Front Leg Raises","f":"legSwing","o":{"dir":"front"},"u":"side"},{"id":"Front_Plate_Raise","n":"Front Plate Raise","lv":1,"c":"strength","m":["shoulders"],"s":"delts","p":1,"f":"frontRaise","o":{"load":"bb"},"nd":["plate"]},{"id":"Front_Raise_And_Pullover","n":"Front Raise And Pullover","lv":0,"c":"strength","m":["chest"],"s":"chestIso","p":1,"m2":["lats","shoulders","triceps"],"f":"pullover","o":{"load":"bb"},"nd":["barbell","bench"]},{"id":"Front_Squat_Clean_Grip","n":"Front Squat (Clean Grip)","lv":1,"c":"strength","m":["quadriceps"],"s":"knee","p":1,"m2":["abdominals","glutes","hamstrings"],"f":"squat","o":{"load":"front"},"nd":["barbell"]},{"id":"Front_Squats_With_Two_Kettlebells","n":"Front Squats With Two Kettlebells","lv":1,"c":"strength","m":["quadriceps"],"s":"knee","p":2,"m2":["calves","glutes"],"f":"squat","o":{"load":"goblet"},"nd":["kettlebell"]},{"id":"Front_Two-Dumbbell_Raise","n":"Front Two-Dumbbell Raise","lv":0,"c":"strength","m":["shoulders"],"s":"delts","p":1,"f":"frontRaise","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Full_Range-Of-Motion_Lat_Pulldown","n":"Full Range-Of-Motion Lat Pulldown","lv":1,"c":"strength","m":["lats"],"s":"vpull","p":1,"m2":["biceps","middle back","shoulders"],"f":"pulldown","nd":["cable"]},{"id":"Gironda_Sternum_Chins","n":"Gironda Sternum Chins","lv":1,"c":"strength","m":["lats"],"s":"vpull","p":1,"m2":["biceps","middle back"],"f":"pullUp","nd":["pullupbar"]},{"id":"Glute_Ham_Raise","n":"Glute Ham Raise","lv":1,"c":"powerlifting","m":["hamstrings"],"s":"hipIso","p":1,"m2":["calves","glutes"],"f":"nordic","ax":1,"nd":["machine"]},{"id":"Glute_Kickback","n":"Glute Kickback","lv":0,"c":"strength","m":["glutes"],"s":"hipIso","p":3,"m2":["hamstrings"],"f":"kickback","o":{"pos":"quad"},"u":"side"},{"id":"Goblet_Squat","n":"Goblet Squat","lv":0,"c":"strength","m":["quadriceps"],"s":"knee","p":3,"m2":["calves","glutes","hamstrings","shoulders"],"f":"squat","o":{"load":"goblet"},"nd":["kettlebell"]},{"id":"Good_Morning","n":"Good Morning","lv":1,"c":"powerlifting","m":["hamstrings"],"s":"hip","p":2,"m2":["abdominals","glutes","lower back"],"f":"goodMorning","o":{"load":"bb"},"nd":["barbell"]},{"id":"Good_Morning_off_Pins","n":"Good Morning off Pins","lv":1,"c":"powerlifting","m":["hamstrings"],"s":"hip","p":1,"m2":["abdominals","glutes","lower back"],"f":"goodMorning","o":{"load":"bb"},"nd":["barbell","rack"]},{"id":"Gorilla_Chin_Crunch","n":"Gorilla Chin/Crunch","lv":1,"c":"strength","m":["abdominals"],"s":"core","p":0,"m2":["biceps","lats"],"f":"hangRaise","ax":1,"nd":["pullupbar"]},{"id":"Groin_and_Back_Stretch","n":"Butterfly Stretch","lv":1,"c":"stretching","m":["adductors"],"s":"stretch","p":3,"a":"Groin and Back Stretch","f":"stButterfly"},{"id":"Groiners","n":"Groiners","lv":1,"c":"stretching","m":["adductors"],"s":"stretch","p":1,"f":"stHipFlexor","ax":1,"u":"side"},{"id":"Hack_Squat","n":"Hack Squat","lv":0,"c":"strength","m":["quadriceps"],"s":"knee","p":2,"m2":["calves","glutes","hamstrings"],"f":"legPress","ax":1,"nd":["machine"]},{"id":"Hammer_Curls","n":"Hammer Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":3,"a":"Hammer Curls","f":"curl","o":{"load":"db","pos":"stand"},"nd":["dumbbell"]},{"id":"Hammer_Grip_Incline_DB_Bench_Press","n":"Hammer Grip Incline DB Bench Press","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["shoulders","triceps"],"f":"benchPress","o":{"load":"db","inc":"incline"},"nd":["bench","dumbbell"]},{"id":"Hamstring-SMR","n":"Hamstring-SMR","lv":0,"c":"stretching","m":["hamstrings"],"s":"stretch","p":1,"f":"smr","o":{"pos":"seated"},"nd":["foamroll"]},{"id":"Hamstring_Stretch","n":"Hamstring Stretch","lv":0,"c":"stretching","m":["hamstrings"],"s":"stretch","p":1,"f":"stFold"},{"id":"Handstand_Push-Ups","n":"Handstand Push-Ups","lv":2,"c":"strength","m":["shoulders"],"s":"none","p":1,"m2":["triceps"]},{"id":"Hang_Clean","n":"Hang Clean","lv":1,"c":"olympic weightlifting","m":["quadriceps"],"s":"olympic","p":1,"m2":["calves","forearms","glutes","hamstrings","lower back","shoulders","traps"],"f":"clean","o":{"load":"bb","hang":1},"nd":["barbell"]},{"id":"Hang_Clean_-_Below_the_Knees","n":"Hang Clean - Below the Knees","lv":1,"c":"olympic weightlifting","m":["quadriceps"],"s":"olympic","p":1,"m2":["calves","forearms","glutes","hamstrings","lower back","shoulders","traps"],"f":"clean","o":{"load":"bb","hang":1},"nd":["barbell"]},{"id":"Hang_Snatch","n":"Hang Snatch","lv":2,"c":"olympic weightlifting","m":["hamstrings"],"s":"olympic","p":1,"m2":["abdominals","calves","forearms","glutes","lower back","quadriceps","shoulders","traps"],"f":"snatch","o":{"load":"bb","hang":1},"nd":["barbell"]},{"id":"Hang_Snatch_-_Below_Knees","n":"Hang Snatch - Below Knees","lv":2,"c":"olympic weightlifting","m":["hamstrings"],"s":"olympic","p":1,"m2":["abdominals","calves","forearms","glutes","lower back","quadriceps","shoulders","traps"],"f":"snatch","o":{"load":"bb","hang":1},"nd":["barbell"]},{"id":"Hanging_Bar_Good_Morning","n":"Hanging Bar Good Morning","lv":1,"c":"powerlifting","m":["hamstrings"],"s":"hip","p":1,"m2":["abdominals","glutes","lower back"],"f":"goodMorning","o":{"load":"bb"},"nd":["barbell","pullupbar"]},{"id":"Hanging_Leg_Raise","n":"Hanging Leg Raise","lv":2,"c":"strength","m":["abdominals"],"s":"core","p":2,"f":"hangRaise","nd":["pullupbar"]},{"id":"Hanging_Pike","n":"Hanging Pike","lv":2,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"hangRaise","nd":["pullupbar"]},{"id":"Heaving_Snatch_Balance","n":"Heaving Snatch Balance","lv":1,"c":"olympic weightlifting","m":["quadriceps"],"s":"knee","p":0,"m2":["abdominals","forearms","glutes","hamstrings","shoulders","triceps"],"f":"squat","o":{"load":"oh"},"ax":1,"nd":["barbell"]},{"id":"Heavy_Bag_Thrust","n":"Heavy Bag Thrust","lv":0,"c":"plyometrics","m":["chest"],"s":"plyo","p":0,"m2":["abdominals","shoulders","triceps"],"f":"chestPass","ax":1,"nd":["other"]},{"id":"High_Cable_Curls","n":"High Cable Curls","lv":1,"c":"strength","m":["biceps"],"s":"biceps","p":1,"f":"highCurl","nd":["cable"]},{"id":"Hip_Circles_prone","n":"Hip Circles (prone)","lv":0,"c":"stretching","m":["abductors"],"s":"none","p":1,"m2":["adductors"]},{"id":"Hip_Extension_with_Bands","n":"Hip Extension with Bands","lv":0,"c":"strength","m":["glutes"],"s":"hipIso","p":2,"m2":["hamstrings"],"f":"legSwing","o":{"load":"band","dir":"back"},"nd":["bands"],"u":"side"},{"id":"Hip_Flexion_with_Band","n":"Hip Flexion with Band","lv":0,"c":"strength","m":["quadriceps"],"s":"hipIso","p":1,"f":"legSwing","o":{"load":"band","dir":"front"},"nd":["bands"],"u":"side"},{"id":"Hip_Lift_with_Band","n":"Banded Glute Bridge","lv":0,"c":"powerlifting","m":["glutes"],"s":"hip","p":2,"a":"Hip Lift with Band","m2":["calves","hamstrings"],"f":"bridge","o":{"band":1},"nd":["bands"]},{"id":"Hug_A_Ball","n":"Hug A Ball","lv":0,"c":"stretching","m":["lower back"],"s":"stretch","p":1,"m2":["calves","glutes"],"f":"stSeatFold","ax":1,"nd":["exball"]},{"id":"Hug_Knees_To_Chest","n":"Hug Knees To Chest","lv":0,"c":"stretching","m":["lower back"],"s":"stretch","p":2,"m2":["glutes"],"f":"stKneeChest","o":{"both":1}},{"id":"Hurdle_Hops","n":"Hurdle Hops","lv":0,"c":"plyometrics","m":["hamstrings"],"s":"plyo","p":0,"m2":["abductors","adductors","calves","glutes","hamstrings"],"f":"jump","ax":1,"nd":["other"]},{"id":"Hyperextensions_Back_Extensions","n":"Back Extension","lv":0,"c":"strength","m":["lower back"],"s":"hipIso","p":3,"a":"Hyperextensions (Back Extensions)","m2":["glutes","hamstrings"],"f":"hyperext","nd":["machine"]},{"id":"Hyperextensions_With_No_Hyperextension_Bench","n":"Hyperextensions With No Hyperextension Bench","lv":1,"c":"strength","m":["lower back"],"s":"hipIso","p":1,"m2":["glutes","hamstrings"],"f":"hyperext","ax":1,"nd":["bench"]},{"id":"IT_Band_and_Glute_Stretch","n":"IT Band and Glute Stretch","lv":1,"c":"stretching","m":["abductors"],"s":"stretch","p":1,"f":"stSeatTwist","ax":1,"u":"side"},{"id":"Iliotibial_Tract-SMR","n":"Iliotibial Tract-SMR","lv":1,"c":"stretching","m":["abductors"],"s":"stretch","p":1,"f":"smr","o":{"pos":"side"},"nd":["foamroll"]},{"id":"Inchworm","n":"Inchworm","lv":0,"c":"stretching","m":["hamstrings"],"s":"stretch","p":1,"f":"stFold","ax":1},{"id":"Incline_Barbell_Triceps_Extension","n":"Incline Barbell Triceps Extension","lv":1,"c":"strength","m":["triceps"],"s":"triceps","p":1,"m2":["forearms"],"f":"overTri","o":{"load":"bb"},"ax":1,"nd":["barbell","bench"]},{"id":"Incline_Bench_Pull","n":"Incline Bench Pull","lv":0,"c":"strength","m":["middle back"],"s":"hpull","p":1,"m2":["lats","shoulders"],"f":"bentRow","o":{"load":"bb","bench":1},"ax":1,"nd":["barbell","bench"]},{"id":"Incline_Cable_Chest_Press","n":"Incline Cable Chest Press","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["shoulders","triceps"],"f":"benchPress","o":{"load":"cable","inc":"incline"},"nd":["bench","cable"]},{"id":"Incline_Cable_Flye","n":"Incline Cable Flye","lv":1,"c":"strength","m":["chest"],"s":"chestIso","p":1,"m2":["shoulders"],"f":"fly","o":{"load":"cable","pos":"lying"},"nd":["bench","cable"]},{"id":"Incline_Dumbbell_Bench_With_Palms_Facing_In","n":"Incline Dumbbell Bench With Palms Facing In","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["shoulders","triceps"],"f":"benchPress","o":{"load":"db","inc":"incline"},"nd":["bench","dumbbell"]},{"id":"Incline_Dumbbell_Curl","n":"Incline Dumbbell Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":2,"f":"curl","o":{"load":"db","pos":"incline"},"nd":["bench","dumbbell"]},{"id":"Incline_Dumbbell_Flyes","n":"Incline Dumbbell Flyes","lv":0,"c":"strength","m":["chest"],"s":"chestIso","p":2,"m2":["shoulders"],"f":"fly","o":{"load":"db","pos":"lying"},"nd":["bench","dumbbell"]},{"id":"Incline_Dumbbell_Flyes_-_With_A_Twist","n":"Incline Dumbbell Flyes - With A Twist","lv":0,"c":"strength","m":["chest"],"s":"chestIso","p":1,"m2":["shoulders"],"f":"fly","o":{"load":"db","pos":"lying"},"nd":["bench","dumbbell"]},{"id":"Incline_Dumbbell_Press","n":"Incline Dumbbell Press","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":3,"m2":["shoulders","triceps"],"f":"benchPress","o":{"load":"db","inc":"incline"},"nd":["bench","dumbbell"]},{"id":"Incline_Hammer_Curls","n":"Incline Hammer Curls","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":1,"f":"curl","o":{"load":"db","pos":"incline"},"nd":["bench","dumbbell"]},{"id":"Incline_Inner_Biceps_Curl","n":"Incline Inner Biceps Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":1,"f":"curl","o":{"load":"db","pos":"incline"},"nd":["bench","dumbbell"]},{"id":"Incline_Push-Up","n":"Incline Push-Up","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":3,"m2":["shoulders","triceps"],"f":"pushup","o":{"v":"incline"}},{"id":"Incline_Push-Up_Close-Grip","n":"Incline Push-Up Close-Grip","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":1,"m2":["chest","shoulders"],"f":"pushup","o":{"v":"incline"}},{"id":"Incline_Push-Up_Depth_Jump","n":"Incline Push-Up Depth Jump","lv":0,"c":"plyometrics","m":["chest"],"s":"plyo","p":1,"m2":["shoulders","triceps"],"f":"boxJump","ax":1,"nd":["bench","box"]},{"id":"Incline_Push-Up_Medium","n":"Incline Push-Up Medium","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["abdominals","shoulders","triceps"],"f":"pushup","o":{"v":"incline"}},{"id":"Incline_Push-Up_Reverse_Grip","n":"Incline Push-Up Reverse Grip","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["abdominals","shoulders","triceps"],"f":"pushup","o":{"v":"incline"}},{"id":"Incline_Push-Up_Wide","n":"Incline Push-Up Wide","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["abdominals","shoulders","triceps"],"f":"pushup","o":{"v":"incline"}},{"id":"Intermediate_Groin_Stretch","n":"Intermediate Groin Stretch","lv":1,"c":"stretching","m":["hamstrings"],"s":"stretch","p":1,"f":"stButterfly","ax":1},{"id":"Intermediate_Hip_Flexor_and_Quad_Stretch","n":"Intermediate Hip Flexor and Quad Stretch","lv":1,"c":"stretching","m":["quadriceps"],"s":"stretch","p":1,"f":"stHipFlexor","u":"side"},{"id":"Internal_Rotation_with_Band","n":"Internal Rotation with Band","lv":0,"c":"strength","m":["shoulders"],"s":"rear","p":1,"f":"rotation","o":{"load":"band","inward":1},"nd":["bands"],"u":"side"},{"id":"Inverted_Row","n":"Inverted Row","lv":0,"c":"strength","m":["middle back"],"s":"hpull","p":3,"m2":["lats"],"f":"invRow","nd":["rack"]},{"id":"Inverted_Row_with_Straps","n":"Inverted Row with Straps","lv":0,"c":"strength","m":["middle back"],"s":"hpull","p":2,"m2":["biceps","lats"],"f":"invRow","nd":["trx"]},{"id":"Iron_Cross","n":"Iron Cross","lv":1,"c":"strength","m":["shoulders"],"s":"none","p":1,"m2":["chest","glutes","hamstrings","lower back","quadriceps","traps"],"nd":["dumbbell"]},{"id":"Iron_Crosses_stretch","n":"Iron Crosses (stretch)","lv":1,"c":"stretching","m":["quadriceps"],"s":"stretch","p":1,"f":"stTwistLying","u":"side"},{"id":"Isometric_Chest_Squeezes","n":"Isometric Chest Squeezes","lv":0,"c":"plyometrics","m":["chest"],"s":"none","p":1,"m2":["shoulders","triceps"]},{"id":"Isometric_Neck_Exercise_-_Front_And_Back","n":"Isometric Neck Exercise - Front And Back","lv":0,"c":"strength","m":["neck"],"s":"none","p":1},{"id":"Isometric_Neck_Exercise_-_Sides","n":"Isometric Neck Exercise - Sides","lv":0,"c":"strength","m":["neck"],"s":"none","p":1},{"id":"Isometric_Wipers","n":"Isometric Wipers","lv":0,"c":"strength","m":["chest"],"s":"none","p":1,"m2":["abdominals","shoulders","triceps"]},{"id":"JM_Press","n":"JM Press","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":0,"m2":["chest","shoulders"],"f":"benchPress","o":{"load":"bb","inc":"flat"},"nd":["barbell","bench"]},{"id":"Jackknife_Sit-Up","n":"Jackknife Sit-Up","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":2,"f":"vup"},{"id":"Janda_Sit-Up","n":"Janda Sit-Up","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":0,"f":"situp"},{"id":"Jefferson_Squats","n":"Jefferson Squats","lv":1,"c":"strength","m":["quadriceps"],"s":"knee","p":0,"m2":["calves","glutes","hamstrings","lower back","traps"],"f":"squat","o":{"load":"bbBack"},"ax":1,"nd":["barbell"]},{"id":"Jerk_Balance","n":"Jerk Balance","lv":1,"c":"olympic weightlifting","m":["shoulders"],"s":"none","p":1,"m2":["glutes","hamstrings","quadriceps","triceps"],"nd":["barbell"]},{"id":"Jerk_Dip_Squat","n":"Jerk Dip Squat","lv":1,"c":"olympic weightlifting","m":["quadriceps"],"s":"none","p":1,"m2":["abdominals","calves"],"nd":["barbell"]},{"id":"Jogging_Treadmill","n":"Treadmill Jog","lv":0,"c":"cardio","m":["quadriceps"],"s":"cardio","p":3,"a":"Jogging, Treadmill","m2":["glutes","hamstrings"],"f":"run","nd":["cardio"]},{"id":"Keg_Load","n":"Keg Load","lv":1,"c":"strongman","m":["lower back"],"s":"none","p":0,"m2":["abdominals","biceps","calves","forearms","glutes","hamstrings","middle back","quadriceps","shoulders","traps"],"nd":["other"]},{"id":"Kettlebell_Arnold_Press","n":"Kettlebell Arnold Press","lv":1,"c":"strength","m":["shoulders"],"s":"vpush","p":1,"m2":["triceps"],"f":"ohPress","o":{"load":"kb"},"nd":["kettlebell"]},{"id":"Kettlebell_Dead_Clean","n":"Kettlebell Dead Clean","lv":1,"c":"strength","m":["hamstrings"],"s":"olympic","p":1,"m2":["calves","glutes","lower back","quadriceps","traps"],"f":"clean","o":{"load":"kb"},"nd":["kettlebell"]},{"id":"Kettlebell_Figure_8","n":"Kettlebell Figure 8","lv":1,"c":"strength","m":["abdominals"],"s":"none","p":1,"m2":["hamstrings","shoulders"],"nd":["kettlebell"]},{"id":"Kettlebell_Halo","n":"Kettlebell Halo","lv":0,"c":"strength","m":["shoulders"],"s":"none","p":1,"m2":["traps","middle back","abdominals","triceps"],"nd":["kettlebell"]},{"id":"Kettlebell_Halo_With_Overhead_Extension","n":"Kettlebell Halo with Overhead Extension","lv":1,"c":"strength","m":["shoulders","triceps"],"s":"none","p":1,"m2":["traps","middle back","abdominals"],"nd":["kettlebell"]},{"id":"Kettlebell_Hang_Clean","n":"Kettlebell Hang Clean","lv":1,"c":"strength","m":["hamstrings"],"s":"olympic","p":1,"m2":["calves","glutes","lower back","shoulders","traps"],"f":"clean","o":{"load":"kb","hang":1},"nd":["kettlebell"]},{"id":"Kettlebell_One-Legged_Deadlift","n":"Kettlebell One-Legged Deadlift","lv":1,"c":"strength","m":["hamstrings"],"s":"hip","p":1,"m2":["glutes","lower back"],"f":"deadlift","o":{"load":"kb"},"ax":1,"nd":["kettlebell"],"u":"side"},{"id":"Kettlebell_Overhead_Triceps_Extension","n":"Kettlebell Overhead Triceps Extension","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":1,"m2":["shoulders","abdominals"],"f":"overTri","o":{"load":"kb"},"nd":["kettlebell"]},{"id":"Kettlebell_Pass_Between_The_Legs","n":"Kettlebell Pass Between The Legs","lv":1,"c":"strength","m":["abdominals"],"s":"none","p":1,"m2":["glutes","hamstrings","shoulders"],"nd":["kettlebell"]},{"id":"Kettlebell_Pirate_Ships","n":"Kettlebell Pirate Ships","lv":0,"c":"strength","m":["shoulders"],"s":"none","p":1,"m2":["abdominals"],"nd":["kettlebell"]},{"id":"Kettlebell_Pistol_Squat","n":"Kettlebell Pistol Squat","lv":2,"c":"strength","m":["quadriceps"],"s":"none","p":1,"m2":["calves","glutes","hamstrings","shoulders"],"nd":["kettlebell"]},{"id":"Kettlebell_Seated_Press","n":"Kettlebell Seated Press","lv":1,"c":"strength","m":["shoulders"],"s":"vpush","p":1,"m2":["triceps"],"f":"ohPress","o":{"load":"kb","seat":1},"nd":["kettlebell"]},{"id":"Kettlebell_Seesaw_Press","n":"Kettlebell Seesaw Press","lv":1,"c":"strength","m":["shoulders"],"s":"vpush","p":1,"m2":["triceps"],"f":"ohPress","o":{"load":"kb"},"nd":["kettlebell"],"u":"alt"},{"id":"Kettlebell_Sumo_High_Pull","n":"Kettlebell Sumo High Pull","lv":1,"c":"strength","m":["traps"],"s":"olympic","p":1,"m2":["adductors","glutes","hamstrings","quadriceps","shoulders"],"f":"highPull","o":{"load":"kb"},"nd":["kettlebell"]},{"id":"Kettlebell_Thruster","n":"Kettlebell Thruster","lv":1,"c":"strength","m":["shoulders"],"s":"knee","p":2,"m2":["quadriceps","triceps"],"f":"squat","o":{"load":"goblet"},"ax":1,"nd":["kettlebell"]},{"id":"Kettlebell_Turkish_Get-Up_Lunge_style","n":"Kettlebell Turkish Get-Up (Lunge style)","lv":1,"c":"strength","m":["shoulders"],"s":"none","p":1,"m2":["abdominals","hamstrings","quadriceps","triceps"],"nd":["kettlebell"]},{"id":"Kettlebell_Turkish_Get-Up_Squat_style","n":"Kettlebell Turkish Get-Up (Squat style)","lv":1,"c":"strength","m":["shoulders"],"s":"none","p":1,"m2":["abdominals","calves","hamstrings","quadriceps","triceps"],"nd":["kettlebell"]},{"id":"Kettlebell_Windmill","n":"Kettlebell Windmill","lv":1,"c":"strength","m":["abdominals"],"s":"core","p":1,"m2":["glutes","hamstrings","shoulders","triceps"],"f":"sideBend","o":{"load":"kb"},"ax":1,"nd":["kettlebell"],"u":"side"},{"id":"Kipping_Muscle_Up","n":"Kipping Muscle Up","lv":1,"c":"strength","m":["lats"],"s":"none","p":1,"m2":["abdominals","biceps","forearms","middle back","shoulders","traps","triceps"],"nd":["pullupbar"]},{"id":"Knee_Across_The_Body","n":"Lying Knee Twist","lv":0,"c":"stretching","m":["glutes"],"s":"stretch","p":3,"a":"Knee Across The Body","m2":["abductors","lower back"],"f":"stTwistLying","u":"side"},{"id":"Knee_Circles","n":"Knee Circles","lv":0,"c":"stretching","m":["calves"],"s":"stretch","p":1,"m2":["hamstrings","quadriceps"],"f":"hipCircles","ax":1},{"id":"Knee_Hip_Raise_On_Parallel_Bars","n":"Knee/Hip Raise On Parallel Bars","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":2,"f":"hangRaise","nd":["dipbars"]},{"id":"Knee_Tuck_Jump","n":"Knee Tuck Jump","lv":0,"c":"plyometrics","m":["hamstrings"],"s":"plyo","p":1,"m2":["abductors","adductors","calves","glutes","quadriceps"],"f":"jump","o":{"tuck":1}},{"id":"Kneeling_Arm_Drill","n":"Kneeling Arm Drill","lv":0,"c":"plyometrics","m":["shoulders"],"s":"none","p":1,"m2":["abdominals"]},{"id":"Kneeling_Cable_Crunch_With_Alternating_Oblique_Twists","n":"Kneeling Cable Crunch With Alternating Oblique Twists","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"cableCrunch","nd":["cable"],"u":"alt"},{"id":"Kneeling_Cable_Triceps_Extension","n":"Kneeling Cable Triceps Extension","lv":1,"c":"strength","m":["triceps"],"s":"triceps","p":1,"f":"overTri","o":{"load":"cable"},"ax":1,"nd":["cable"]},{"id":"Kneeling_Forearm_Stretch","n":"Kneeling Forearm Stretch","lv":0,"c":"stretching","m":["forearms"],"s":"none","p":1},{"id":"Kneeling_High_Pulley_Row","n":"Kneeling High Pulley Row","lv":0,"c":"strength","m":["lats"],"s":"vpull","p":1,"m2":["biceps","middle back"],"f":"pulldown","ax":1,"nd":["cable"]},{"id":"Kneeling_Hip_Flexor","n":"Kneeling Hip Flexor Stretch","lv":0,"c":"stretching","m":["quadriceps"],"s":"stretch","p":3,"a":"Kneeling Hip Flexor","m2":["quadriceps"],"f":"stHipFlexor","u":"side"},{"id":"Kneeling_Jump_Squat","n":"Kneeling Jump Squat","lv":2,"c":"olympic weightlifting","m":["glutes"],"s":"none","p":1,"m2":["calves","hamstrings","quadriceps"],"nd":["barbell"]},{"id":"Kneeling_Single-Arm_High_Pulley_Row","n":"Kneeling Single-Arm High Pulley Row","lv":0,"c":"strength","m":["lats"],"s":"vpull","p":1,"m2":["biceps","middle back"],"f":"pulldown","ax":1,"nd":["cable"],"u":"side"},{"id":"Kneeling_Squat","n":"Kneeling Squat","lv":1,"c":"powerlifting","m":["glutes"],"s":"none","p":1,"m2":["abdominals","hamstrings","lower back"],"nd":["barbell"]},{"id":"Landmine_180s","n":"Landmine 180's","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"m2":["glutes","lower back","shoulders"],"f":"twist","o":{"load":"bb"},"ax":1,"nd":["barbell"]},{"id":"Landmine_Linear_Jammer","n":"Landmine Linear Jammer","lv":1,"c":"strength","m":["shoulders"],"s":"none","p":1,"m2":["abdominals","calves","chest","hamstrings","quadriceps","triceps"],"nd":["barbell"]},{"id":"Lateral_Bound","n":"Lateral Bound","lv":0,"c":"plyometrics","m":["adductors"],"s":"plyo","p":3,"m2":["abductors","calves","glutes","hamstrings","quadriceps"],"f":"lateralHop"},{"id":"Lateral_Box_Jump","n":"Lateral Box Jump","lv":0,"c":"plyometrics","m":["adductors"],"s":"plyo","p":1,"m2":["abductors","calves","glutes","hamstrings","quadriceps"],"f":"boxJump","nd":["box"]},{"id":"Lateral_Cone_Hops","n":"Lateral Cone Hops","lv":0,"c":"plyometrics","m":["adductors"],"s":"plyo","p":0,"m2":["abductors","calves","glutes","hamstrings","quadriceps"],"f":"lateralHop","nd":["other"]},{"id":"Lateral_Raise_-_With_Bands","n":"Band Lateral Raise","lv":0,"c":"strength","m":["shoulders"],"s":"delts","p":3,"a":"Lateral Raise - With Bands","f":"lateralRaise","o":{"load":"band"},"nd":["bands"]},{"id":"Latissimus_Dorsi-SMR","n":"Latissimus Dorsi-SMR","lv":0,"c":"stretching","m":["lats"],"s":"stretch","p":1,"f":"smr","o":{"pos":"side"},"nd":["foamroll"]},{"id":"Leg-Over_Floor_Press","n":"Leg-Over Floor Press","lv":1,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["shoulders","triceps"],"f":"benchPress","o":{"load":"kb","inc":"floor"},"nd":["kettlebell"]},{"id":"Leg-Up_Hamstring_Stretch","n":"Leg-Up Hamstring Stretch","lv":0,"c":"stretching","m":["hamstrings"],"s":"stretch","p":2,"f":"stLegUp","u":"side"},{"id":"Leg_Extensions","n":"Leg Extension","lv":0,"c":"strength","m":["quadriceps"],"s":"kneeIso","p":3,"a":"Leg Extensions","f":"legExt","nd":["machine"]},{"id":"Leg_Lift","n":"Leg Lift","lv":0,"c":"strength","m":["glutes"],"s":"hipIso","p":2,"m2":["hamstrings"],"f":"legSwing","o":{"dir":"back"},"u":"side"},{"id":"Leg_Press","n":"Leg Press","lv":0,"c":"strength","m":["quadriceps"],"s":"knee","p":3,"m2":["calves","glutes","hamstrings"],"f":"legPress","nd":["machine"]},{"id":"Leg_Pull-In","n":"Leg Pull-In","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":2,"f":"legRaise"},{"id":"Leverage_Chest_Press","n":"Leverage Chest Press","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":2,"m2":["shoulders","triceps"],"f":"chestPressSeated","nd":["machine"]},{"id":"Leverage_Deadlift","n":"Leverage Deadlift","lv":0,"c":"strength","m":["quadriceps"],"s":"hip","p":1,"m2":["glutes","hamstrings"],"f":"deadlift","o":{"load":"bb","style":"conv"},"nd":["machine"]},{"id":"Leverage_Decline_Chest_Press","n":"Leverage Decline Chest Press","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["shoulders","triceps"],"f":"chestPressSeated","nd":["machine"]},{"id":"Leverage_High_Row","n":"Leverage High Row","lv":0,"c":"strength","m":["middle back"],"s":"hpull","p":2,"m2":["lats"],"f":"seatedRow","o":{"load":"machine"},"nd":["machine"]},{"id":"Leverage_Incline_Chest_Press","n":"Leverage Incline Chest Press","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":2,"m2":["shoulders","triceps"],"f":"chestPressSeated","nd":["machine"]},{"id":"Leverage_Iso_Row","n":"Leverage Iso Row","lv":0,"c":"strength","m":["lats"],"s":"hpull","p":2,"m2":["biceps","middle back"],"f":"seatedRow","o":{"load":"machine"},"nd":["machine"]},{"id":"Leverage_Shoulder_Press","n":"Leverage Shoulder Press","lv":0,"c":"strength","m":["shoulders"],"s":"vpush","p":2,"m2":["triceps"],"f":"ohPress","o":{"load":"machine"},"nd":["machine"]},{"id":"Leverage_Shrug","n":"Leverage Shrug","lv":0,"c":"strength","m":["traps"],"s":"traps","p":1,"m2":["forearms"],"f":"shrug","o":{"load":"bb"},"nd":["machine"]},{"id":"Linear_3-Part_Start_Technique","n":"Linear 3-Part Start Technique","lv":0,"c":"plyometrics","m":["hamstrings"],"s":"cardio","p":1,"m2":["calves","quadriceps"],"f":"run","ax":1},{"id":"Linear_Acceleration_Wall_Drill","n":"Linear Acceleration Wall Drill","lv":0,"c":"plyometrics","m":["hamstrings"],"s":"cardio","p":1,"m2":["calves","glutes","quadriceps"],"f":"run","ax":1},{"id":"Linear_Depth_Jump","n":"Linear Depth Jump","lv":1,"c":"plyometrics","m":["quadriceps"],"s":"plyo","p":1,"m2":["calves","glutes","hamstrings"],"f":"boxJump","ax":1,"nd":["box"]},{"id":"Log_Lift","n":"Log Lift","lv":1,"c":"strongman","m":["shoulders"],"s":"vpush","p":0,"m2":["abdominals","chest","glutes","hamstrings","lower back","middle back","quadriceps","traps","triceps"],"f":"ohPress","o":{"load":"bb"},"ax":1,"nd":["other"]},{"id":"London_Bridges","n":"London Bridges","lv":1,"c":"strength","m":["lats"],"s":"none","p":0,"m2":["biceps","forearms","middle back"],"nd":["other"]},{"id":"Looking_At_Ceiling","n":"Looking At Ceiling","lv":0,"c":"stretching","m":["quadriceps"],"s":"stretch","p":1,"f":"stHipFlexor","ax":1,"u":"side"},{"id":"Low_Cable_Crossover","n":"Low Cable Crossover","lv":0,"c":"strength","m":["chest"],"s":"chestIso","p":2,"m2":["shoulders"],"f":"fly","o":{"load":"cable","pos":"stand"},"nd":["cable"]},{"id":"Low_Cable_Triceps_Extension","n":"Low Cable Triceps Extension","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":1,"f":"overTri","o":{"load":"cable"},"nd":["cable"]},{"id":"Low_Pulley_Row_To_Neck","n":"Low Pulley Row To Neck","lv":0,"c":"strength","m":["shoulders"],"s":"delts","p":1,"m2":["biceps","middle back","traps"],"f":"uprightRow","o":{"load":"cable"},"nd":["cable"]},{"id":"Lower_Back-SMR","n":"Lower Back-SMR","lv":0,"c":"stretching","m":["lower back"],"s":"stretch","p":1,"f":"smr","o":{"pos":"supine"},"nd":["foamroll"]},{"id":"Lower_Back_Curl","n":"Lower Back Curl","lv":0,"c":"stretching","m":["abdominals"],"s":"hipIso","p":1,"f":"superman","ax":1},{"id":"Lunge_Pass_Through","n":"Lunge Pass Through","lv":1,"c":"strength","m":["hamstrings"],"s":"knee","p":1,"m2":["calves","glutes","quadriceps"],"f":"lunge","o":{"load":"kb"},"ax":1,"nd":["kettlebell"],"u":"side"},{"id":"Lunge_Sprint","n":"Lunge Sprint","lv":1,"c":"strength","m":["quadriceps"],"s":"none","p":1,"m2":["calves","glutes","hamstrings"],"nd":["machine"]},{"id":"Lying_Bent_Leg_Groin","n":"Lying Bent Leg Groin","lv":2,"c":"stretching","m":["adductors"],"s":"stretch","p":1,"f":"stTwistLying","ax":1,"u":"side"},{"id":"Lying_Cable_Curl","n":"Lying Cable Curl","lv":1,"c":"strength","m":["biceps"],"s":"biceps","p":1,"f":"curl","o":{"load":"cable","pos":"incline"},"ax":1,"nd":["bench","cable"]},{"id":"Lying_Cambered_Barbell_Row","n":"Lying Cambered Barbell Row","lv":0,"c":"strength","m":["middle back"],"s":"hpull","p":1,"m2":["biceps","lats","traps"],"f":"bentRow","o":{"load":"bb","bench":1},"ax":1,"nd":["barbell","bench"]},{"id":"Lying_Close-Grip_Bar_Curl_On_High_Pulley","n":"Lying Close-Grip Bar Curl On High Pulley","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":1,"f":"curl","o":{"load":"cable","pos":"incline"},"ax":1,"nd":["bench","cable"]},{"id":"Lying_Close-Grip_Barbell_Triceps_Extension_Behind_The_Head","n":"Lying Close-Grip Barbell Triceps Extension Behind The Head","lv":1,"c":"strength","m":["triceps"],"s":"triceps","p":1,"f":"skull","o":{"load":"bb"},"nd":["barbell","bench"]},{"id":"Lying_Close-Grip_Barbell_Triceps_Press_To_Chin","n":"Lying Close-Grip Barbell Triceps Press To Chin","lv":1,"c":"strength","m":["triceps"],"s":"triceps","p":1,"f":"skull","o":{"load":"bb"},"nd":["barbell","bench"]},{"id":"Lying_Crossover","n":"Lying Crossover","lv":2,"c":"stretching","m":["abductors"],"s":"stretch","p":1,"f":"stTwistLying","u":"side"},{"id":"Lying_Dumbbell_Tricep_Extension","n":"Lying Dumbbell Tricep Extension","lv":1,"c":"strength","m":["triceps"],"s":"triceps","p":2,"m2":["chest","shoulders"],"f":"skull","o":{"load":"db"},"nd":["bench","dumbbell"]},{"id":"Lying_Face_Down_Plate_Neck_Resistance","n":"Lying Face Down Plate Neck Resistance","lv":1,"c":"strength","m":["neck"],"s":"none","p":1,"nd":["plate"]},{"id":"Lying_Face_Up_Plate_Neck_Resistance","n":"Lying Face Up Plate Neck Resistance","lv":1,"c":"strength","m":["neck"],"s":"none","p":1,"nd":["plate"]},{"id":"Lying_Glute","n":"Lying Glute","lv":2,"c":"stretching","m":["glutes"],"s":"stretch","p":1,"m2":["abductors"],"f":"stKneeChest","ax":1,"u":"side"},{"id":"Lying_Hamstring","n":"Lying Hamstring","lv":2,"c":"stretching","m":["hamstrings"],"s":"stretch","p":1,"m2":["calves"],"f":"stLegUp","u":"side"},{"id":"Lying_High_Bench_Barbell_Curl","n":"Lying High Bench Barbell Curl","lv":1,"c":"strength","m":["biceps"],"s":"biceps","p":1,"f":"curl","o":{"load":"bb","pos":"incline"},"ax":1,"nd":["barbell","bench"]},{"id":"Lying_Leg_Curls","n":"Lying Leg Curl","lv":0,"c":"strength","m":["hamstrings"],"s":"hipIso","p":3,"a":"Lying Leg Curls","f":"legCurl","o":{"pos":"lying"},"nd":["machine"]},{"id":"Lying_Machine_Squat","n":"Lying Machine Squat","lv":1,"c":"strength","m":["quadriceps"],"s":"knee","p":1,"m2":["calves","glutes","hamstrings"],"f":"legPress","ax":1,"nd":["machine"]},{"id":"Lying_One-Arm_Lateral_Raise","n":"Lying One-Arm Lateral Raise","lv":1,"c":"strength","m":["shoulders"],"s":"delts","p":1,"f":"lateralRaise","o":{"load":"db"},"ax":1,"nd":["dumbbell"],"u":"side"},{"id":"Lying_Prone_Quadriceps","n":"Lying Prone Quadriceps","lv":2,"c":"stretching","m":["quadriceps"],"s":"stretch","p":1,"f":"stQuad","ax":1,"u":"side"},{"id":"Lying_Rear_Delt_Raise","n":"Lying Rear Delt Raise","lv":1,"c":"strength","m":["shoulders"],"s":"rear","p":1,"f":"reverseFly","o":{"load":"db"},"ax":1,"nd":["dumbbell"]},{"id":"Lying_Supine_Dumbbell_Curl","n":"Lying Supine Dumbbell Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":1,"f":"curl","o":{"load":"db","pos":"incline"},"ax":1,"nd":["bench","dumbbell"]},{"id":"Lying_T-Bar_Row","n":"Lying T-Bar Row","lv":1,"c":"strength","m":["middle back"],"s":"hpull","p":1,"m2":["biceps","lats"],"f":"bentRow","o":{"load":"machine","bench":1},"ax":1,"nd":["machine"]},{"id":"Lying_Triceps_Press","n":"Lying Triceps Press","lv":1,"c":"strength","m":["triceps"],"s":"triceps","p":1,"f":"skull","o":{"load":"bb"},"nd":["barbell","bench"]},{"id":"Machine_Bench_Press","n":"Machine Bench Press","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":3,"m2":["shoulders","triceps"],"f":"chestPressSeated","nd":["machine"]},{"id":"Machine_Bicep_Curl","n":"Machine Bicep Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":2,"f":"curl","o":{"load":"machine","pos":"preacher"},"nd":["machine"]},{"id":"Machine_Preacher_Curls","n":"Machine Preacher Curls","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":1,"f":"curl","o":{"load":"machine","pos":"preacher"},"nd":["machine"]},{"id":"Machine_Shoulder_Military_Press","n":"Machine Shoulder (Military) Press","lv":0,"c":"strength","m":["shoulders"],"s":"vpush","p":3,"m2":["triceps"],"f":"ohPress","o":{"load":"machine"},"nd":["machine"]},{"id":"Machine_Triceps_Extension","n":"Machine Triceps Extension","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":1,"f":"pushdown","o":{"load":"machine"},"ax":1,"nd":["machine"]},{"id":"Medicine_Ball_Chest_Pass","n":"Medicine Ball Chest Pass","lv":0,"c":"plyometrics","m":["chest"],"s":"plyo","p":2,"m2":["shoulders","triceps"],"f":"chestPass","nd":["medball"]},{"id":"Medicine_Ball_Full_Twist","n":"Medicine Ball Full Twist","lv":0,"c":"plyometrics","m":["abdominals"],"s":"core","p":1,"m2":["shoulders"],"f":"twist","o":{"load":"ball"},"nd":["medball"]},{"id":"Medicine_Ball_Scoop_Throw","n":"Medicine Ball Scoop Throw","lv":0,"c":"plyometrics","m":["shoulders"],"s":"plyo","p":1,"m2":["abdominals","hamstrings","quadriceps"],"f":"ballSlam","ax":1,"nd":["medball"]},{"id":"Middle_Back_Shrug","n":"Middle Back Shrug","lv":1,"c":"strength","m":["middle back"],"s":"none","p":1,"nd":["dumbbell"]},{"id":"Middle_Back_Stretch","n":"Middle Back Stretch","lv":0,"c":"stretching","m":["middle back"],"s":"stretch","p":1,"m2":["abdominals","lats","lower back"],"f":"sideBend","o":{"hold":1},"ax":1,"u":"side"},{"id":"Mixed_Grip_Chin","n":"Mixed Grip Chin","lv":2,"c":"strength","m":["middle back"],"s":"vpull","p":1,"m2":["biceps","lats"],"f":"pullUp","nd":["pullupbar"]},{"id":"Monster_Walk","n":"Monster Walk","lv":0,"c":"strength","m":["abductors"],"s":"none","p":1,"nd":["bands"]},{"id":"Mountain_Climbers","n":"Mountain Climber","lv":0,"c":"plyometrics","m":["quadriceps"],"s":"cardio","p":3,"a":"Mountain Climbers","m2":["chest","hamstrings","shoulders"],"f":"mountainClimber"},{"id":"Moving_Claw_Series","n":"Moving Claw Series","lv":0,"c":"plyometrics","m":["hamstrings"],"s":"cardio","p":1,"m2":["calves","quadriceps"],"f":"run","ax":1},{"id":"Muscle_Snatch","n":"Muscle Snatch","lv":1,"c":"olympic weightlifting","m":["hamstrings"],"s":"olympic","p":1,"m2":["glutes","lower back","quadriceps","shoulders","triceps"],"f":"snatch","o":{"load":"bb"},"nd":["barbell"]},{"id":"Muscle_Up","n":"Muscle Up","lv":1,"c":"strength","m":["lats"],"s":"none","p":1,"m2":["abdominals","biceps","forearms","middle back","shoulders","traps","triceps"],"nd":["pullupbar"]},{"id":"Narrow_Stance_Hack_Squats","n":"Narrow Stance Hack Squats","lv":1,"c":"strength","m":["quadriceps"],"s":"knee","p":1,"m2":["calves","glutes","hamstrings"],"f":"legPress","ax":1,"nd":["machine"]},{"id":"Narrow_Stance_Leg_Press","n":"Narrow Stance Leg Press","lv":1,"c":"strength","m":["quadriceps"],"s":"knee","p":1,"m2":["calves","glutes","hamstrings"],"f":"legPress","nd":["machine"]},{"id":"Narrow_Stance_Squats","n":"Narrow Stance Squats","lv":1,"c":"strength","m":["quadriceps"],"s":"knee","p":1,"m2":["calves","glutes","hamstrings","lower back"],"f":"squat","o":{"load":"bbBack"},"nd":["barbell"]},{"id":"Natural_Glute_Ham_Raise","n":"Natural Glute Ham Raise","lv":1,"c":"strength","m":["hamstrings"],"s":"hipIso","p":1,"m2":["calves","glutes","lower back"],"f":"nordic"},{"id":"Neck-SMR","n":"Neck-SMR","lv":1,"c":"stretching","m":["neck"],"s":"stretch","p":1,"f":"smr","o":{"pos":"supine"}},{"id":"Neck_Press","n":"Neck Press","lv":1,"c":"strength","m":["chest"],"s":"hpush","p":0,"m2":["shoulders","triceps"],"f":"benchPress","o":{"load":"bb","inc":"flat"},"nd":["barbell","bench"]},{"id":"Oblique_Crunches","n":"Oblique Crunches","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":2,"f":"crunch"},{"id":"Oblique_Crunches_-_On_The_Floor","n":"Oblique Crunches - On The Floor","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"crunch"},{"id":"Olympic_Squat","n":"Olympic Squat","lv":1,"c":"olympic weightlifting","m":["quadriceps"],"s":"knee","p":1,"m2":["calves","glutes","hamstrings"],"f":"squat","o":{"load":"bbBack"},"nd":["barbell"]},{"id":"On-Your-Back_Quad_Stretch","n":"On-Your-Back Quad Stretch","lv":0,"c":"stretching","m":["quadriceps"],"s":"stretch","p":1,"f":"stQuad","ax":1,"u":"side"},{"id":"On_Your_Side_Quad_Stretch","n":"On Your Side Quad Stretch","lv":0,"c":"stretching","m":["quadriceps"],"s":"stretch","p":1,"f":"stQuad","ax":1,"u":"side"},{"id":"One-Arm_Dumbbell_Row","n":"One-Arm Dumbbell Row","lv":0,"c":"strength","m":["middle back"],"s":"hpull","p":3,"m2":["biceps","lats","shoulders"],"f":"bentRow","o":{"load":"db","one":1},"nd":["dumbbell"],"u":"side"},{"id":"One-Arm_Flat_Bench_Dumbbell_Flye","n":"One-Arm Flat Bench Dumbbell Flye","lv":0,"c":"strength","m":["chest"],"s":"chestIso","p":1,"f":"fly","o":{"load":"db","pos":"lying"},"nd":["bench","dumbbell"],"u":"side"},{"id":"One-Arm_High-Pulley_Cable_Side_Bends","n":"One-Arm High-Pulley Cable Side Bends","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"sideBend","o":{"load":"cable"},"nd":["cable"],"u":"side"},{"id":"One-Arm_Incline_Lateral_Raise","n":"One-Arm Incline Lateral Raise","lv":0,"c":"strength","m":["shoulders"],"s":"delts","p":1,"f":"lateralRaise","o":{"load":"db"},"ax":1,"nd":["bench","dumbbell"],"u":"side"},{"id":"One-Arm_Kettlebell_Clean","n":"One-Arm Kettlebell Clean","lv":1,"c":"strength","m":["hamstrings"],"s":"olympic","p":1,"m2":["glutes","lower back","shoulders","traps"],"f":"clean","o":{"load":"kb"},"nd":["kettlebell"],"u":"side"},{"id":"One-Arm_Kettlebell_Clean_and_Jerk","n":"One-Arm Kettlebell Clean and Jerk","lv":1,"c":"strength","m":["shoulders"],"s":"olympic","p":1,"f":"clean","o":{"load":"kb","jerk":1},"nd":["kettlebell"],"u":"side"},{"id":"One-Arm_Kettlebell_Floor_Press","n":"One-Arm Kettlebell Floor Press","lv":1,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["triceps"],"f":"benchPress","o":{"load":"kb","inc":"floor"},"nd":["kettlebell"],"u":"side"},{"id":"One-Arm_Kettlebell_Jerk","n":"One-Arm Kettlebell Jerk","lv":1,"c":"strength","m":["shoulders"],"s":"olympic","p":1,"m2":["calves","quadriceps","triceps"],"f":"jerk","o":{"load":"kb"},"nd":["kettlebell"],"u":"side"},{"id":"One-Arm_Kettlebell_Military_Press_To_The_Side","n":"One-Arm Kettlebell Military Press To The Side","lv":1,"c":"strength","m":["shoulders"],"s":"vpush","p":1,"m2":["triceps"],"f":"ohPress","o":{"load":"kb"},"nd":["kettlebell"],"u":"side"},{"id":"One-Arm_Kettlebell_Para_Press","n":"One-Arm Kettlebell Para Press","lv":1,"c":"strength","m":["shoulders"],"s":"vpush","p":1,"m2":["triceps"],"f":"ohPress","o":{"load":"kb"},"nd":["kettlebell"],"u":"side"},{"id":"One-Arm_Kettlebell_Push_Press","n":"One-Arm Kettlebell Push Press","lv":1,"c":"strength","m":["shoulders"],"s":"vpush","p":1,"m2":["calves","quadriceps","triceps"],"f":"ohPress","o":{"load":"kb"},"ax":1,"nd":["kettlebell"],"u":"side"},{"id":"One-Arm_Kettlebell_Row","n":"One-Arm Kettlebell Row","lv":1,"c":"strength","m":["middle back"],"s":"hpull","p":2,"m2":["biceps","lats"],"f":"bentRow","o":{"load":"kb"},"nd":["kettlebell"],"u":"side"},{"id":"One-Arm_Kettlebell_Snatch","n":"One-Arm Kettlebell Snatch","lv":2,"c":"strength","m":["shoulders"],"s":"olympic","p":1,"m2":["calves","glutes","hamstrings","lower back","traps","triceps"],"f":"snatch","o":{"load":"kb"},"nd":["kettlebell"],"u":"side"},{"id":"One-Arm_Kettlebell_Split_Jerk","n":"One-Arm Kettlebell Split Jerk","lv":1,"c":"strength","m":["shoulders"],"s":"olympic","p":1,"m2":["glutes","hamstrings","quadriceps","triceps"],"f":"jerk","o":{"load":"kb"},"nd":["kettlebell"],"u":"side"},{"id":"One-Arm_Kettlebell_Split_Snatch","n":"One-Arm Kettlebell Split Snatch","lv":2,"c":"strength","m":["shoulders"],"s":"olympic","p":1,"m2":["hamstrings","quadriceps"],"f":"snatch","o":{"load":"kb"},"nd":["kettlebell"],"u":"side"},{"id":"One-Arm_Kettlebell_Swings","n":"One-Arm Kettlebell Swings","lv":1,"c":"strength","m":["hamstrings"],"s":"hip","p":2,"m2":["calves","glutes","lower back","shoulders"],"f":"swing","o":{"load":"kb"},"nd":["kettlebell"],"u":"side"},{"id":"One-Arm_Long_Bar_Row","n":"One-Arm Long Bar Row","lv":0,"c":"strength","m":["middle back"],"s":"hpull","p":1,"m2":["biceps","lats"],"f":"bentRow","o":{"load":"bb"},"nd":["barbell"],"u":"side"},{"id":"One-Arm_Medicine_Ball_Slam","n":"One-Arm Medicine Ball Slam","lv":0,"c":"strength","m":["abdominals"],"s":"plyo","p":1,"m2":["lats","shoulders"],"f":"ballSlam","nd":["medball"],"u":"side"},{"id":"One-Arm_Open_Palm_Kettlebell_Clean","n":"One-Arm Open Palm Kettlebell Clean","lv":1,"c":"strength","m":["hamstrings"],"s":"olympic","p":1,"m2":["forearms","glutes","lower back","quadriceps","shoulders"],"f":"clean","o":{"load":"kb"},"nd":["kettlebell"],"u":"side"},{"id":"One-Arm_Overhead_Kettlebell_Squats","n":"One-Arm Overhead Kettlebell Squats","lv":2,"c":"strength","m":["quadriceps"],"s":"knee","p":1,"m2":["calves","glutes","hamstrings","shoulders"],"f":"squat","o":{"load":"oh"},"nd":["kettlebell"],"u":"side"},{"id":"One-Arm_Side_Deadlift","n":"One-Arm Side Deadlift","lv":2,"c":"strength","m":["quadriceps"],"s":"hip","p":1,"m2":["abdominals","calves","glutes","hamstrings","lower back","traps"],"f":"deadlift","o":{"load":"bb"},"ax":1,"nd":["barbell"],"u":"side"},{"id":"One-Arm_Side_Laterals","n":"One-Arm Side Laterals","lv":0,"c":"strength","m":["shoulders"],"s":"delts","p":1,"f":"lateralRaise","o":{"load":"db"},"nd":["dumbbell"],"u":"side"},{"id":"One-Legged_Cable_Kickback","n":"One-Legged Cable Kickback","lv":1,"c":"strength","m":["glutes"],"s":"hipIso","p":2,"m2":["hamstrings"],"f":"kickback","o":{"load":"cable","pos":"stand"},"nd":["cable"],"u":"side"},{"id":"One_Arm_Against_Wall","n":"One Arm Against Wall","lv":0,"c":"stretching","m":["lats"],"s":"stretch","p":1,"f":"stChest","ax":1,"u":"side"},{"id":"One_Arm_Chin-Up","n":"One Arm Chin-Up","lv":2,"c":"strength","m":["middle back"],"s":"vpull","p":1,"m2":["biceps","forearms","lats"],"f":"pullUp","ax":1,"nd":["pullupbar"],"u":"side"},{"id":"One_Arm_Dumbbell_Bench_Press","n":"One Arm Dumbbell Bench Press","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["shoulders","triceps"],"f":"benchPress","o":{"load":"db","inc":"flat"},"nd":["bench","dumbbell"],"u":"side"},{"id":"One_Arm_Dumbbell_Preacher_Curl","n":"One Arm Dumbbell Preacher Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":1,"f":"curl","o":{"load":"db","pos":"preacher"},"nd":["dumbbell","machine"],"u":"side"},{"id":"One_Arm_Floor_Press","n":"One Arm Floor Press","lv":1,"c":"strength","m":["triceps"],"s":"triceps","p":1,"m2":["chest","shoulders"],"f":"benchPress","o":{"load":"bb","inc":"floor"},"nd":["barbell"],"u":"side"},{"id":"One_Arm_Lat_Pulldown","n":"One Arm Lat Pulldown","lv":0,"c":"strength","m":["lats"],"s":"vpull","p":1,"m2":["biceps","middle back"],"f":"pulldown","nd":["cable"],"u":"side"},{"id":"One_Arm_Pronated_Dumbbell_Triceps_Extension","n":"One Arm Pronated Dumbbell Triceps Extension","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":1,"f":"skull","o":{"load":"db"},"nd":["bench","dumbbell"],"u":"side"},{"id":"One_Arm_Supinated_Dumbbell_Triceps_Extension","n":"One Arm Supinated Dumbbell Triceps Extension","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":1,"f":"skull","o":{"load":"db"},"nd":["bench","dumbbell"],"u":"side"},{"id":"One_Half_Locust","n":"One Half Locust","lv":0,"c":"stretching","m":["quadriceps"],"s":"hipIso","p":1,"m2":["abdominals","biceps","chest"],"f":"superman","ax":1},{"id":"One_Handed_Hang","n":"One Handed Hang","lv":0,"c":"stretching","m":["lats"],"s":"stretch","p":0,"m2":["biceps"],"f":"pullUp","o":{"hang":1},"ax":1,"nd":["pullupbar"],"u":"side"},{"id":"One_Knee_To_Chest","n":"Knee-to-Chest Stretch","lv":0,"c":"stretching","m":["glutes"],"s":"stretch","p":3,"a":"One Knee To Chest","m2":["hamstrings","lower back"],"f":"stKneeChest","u":"side"},{"id":"One_Leg_Barbell_Squat","n":"One Leg Barbell Squat","lv":2,"c":"strength","m":["quadriceps"],"s":"knee","p":1,"m2":["calves","glutes","hamstrings"],"f":"lunge","o":{"load":"bb","mode":"bulgarian"},"nd":["barbell"],"u":"side"},{"id":"Open_Palm_Kettlebell_Clean","n":"Open Palm Kettlebell Clean","lv":2,"c":"strength","m":["hamstrings"],"s":"olympic","p":1,"m2":["glutes","lower back","quadriceps","shoulders"],"f":"clean","o":{"load":"kb"},"nd":["kettlebell"]},{"id":"Otis-Up","n":"Otis-Up","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":0,"m2":["chest","shoulders","triceps"],"f":"situp","nd":["other"]},{"id":"Overhead_Cable_Curl","n":"Overhead Cable Curl","lv":1,"c":"strength","m":["biceps"],"s":"biceps","p":1,"f":"highCurl","nd":["cable"]},{"id":"Overhead_Lat","n":"Overhead Lat","lv":2,"c":"stretching","m":["lats"],"s":"stretch","p":1,"m2":["triceps"],"f":"stTriceps","ax":1,"u":"side"},{"id":"Overhead_Slam","n":"Overhead Slam","lv":0,"c":"plyometrics","m":["lats"],"s":"plyo","p":3,"f":"ballSlam","nd":["medball"]},{"id":"Overhead_Squat","n":"Overhead Squat","lv":2,"c":"olympic weightlifting","m":["quadriceps"],"s":"knee","p":1,"m2":["abdominals","calves","glutes","hamstrings","lower back","shoulders","triceps"],"f":"squat","o":{"load":"oh"},"nd":["barbell"]},{"id":"Overhead_Stretch","n":"Overhead Stretch","lv":0,"c":"stretching","m":["abdominals"],"s":"stretch","p":2,"m2":["chest","forearms","lats","triceps"],"f":"stReach"},{"id":"Overhead_Triceps","n":"Overhead Triceps","lv":2,"c":"stretching","m":["triceps"],"s":"stretch","p":1,"m2":["lats"],"f":"stTriceps","u":"side"},{"id":"Pallof_Press","n":"Pallof Press","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"m2":["chest","shoulders","triceps"],"f":"standPress","o":{"load":"cable"},"ax":1,"nd":["cable"]},{"id":"Pallof_Press_With_Rotation","n":"Pallof Press With Rotation","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"m2":["chest","shoulders","triceps"],"f":"standPress","o":{"load":"cable"},"ax":1,"nd":["cable"]},{"id":"Palms-Down_Dumbbell_Wrist_Curl_Over_A_Bench","n":"Palms-Down Dumbbell Wrist Curl Over A Bench","lv":0,"c":"strength","m":["forearms"],"s":"forearms","p":1,"f":"wristCurl","o":{"load":"db"},"nd":["bench","dumbbell"]},{"id":"Palms-Down_Wrist_Curl_Over_A_Bench","n":"Palms-Down Wrist Curl Over A Bench","lv":0,"c":"strength","m":["forearms"],"s":"forearms","p":1,"f":"wristCurl","o":{"load":"bb"},"nd":["barbell","bench"]},{"id":"Palms-Up_Barbell_Wrist_Curl_Over_A_Bench","n":"Palms-Up Barbell Wrist Curl Over A Bench","lv":0,"c":"strength","m":["forearms"],"s":"forearms","p":1,"f":"wristCurl","o":{"load":"bb"},"nd":["barbell","bench"]},{"id":"Palms-Up_Dumbbell_Wrist_Curl_Over_A_Bench","n":"Palms-Up Dumbbell Wrist Curl Over A Bench","lv":0,"c":"strength","m":["forearms"],"s":"forearms","p":1,"f":"wristCurl","o":{"load":"db"},"nd":["bench","dumbbell"]},{"id":"Parallel_Bar_Dip","n":"Parallel Bar Dip","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":2,"m2":["chest","shoulders"],"f":"dip","o":{"v":"bars"},"nd":["dipbars"]},{"id":"Pelvic_Tilt_Into_Bridge","n":"Pelvic Tilt Into Bridge","lv":1,"c":"stretching","m":["lower back"],"s":"hip","p":0,"f":"bridge"},{"id":"Peroneals-SMR","n":"Peroneals-SMR","lv":1,"c":"stretching","m":["calves"],"s":"stretch","p":1,"f":"smr","o":{"pos":"seated"},"nd":["foamroll"]},{"id":"Peroneals_Stretch","n":"Peroneals Stretch","lv":1,"c":"stretching","m":["calves"],"s":"stretch","p":1,"f":"calf","ax":1,"u":"side"},{"id":"Physioball_Hip_Bridge","n":"Physioball Hip Bridge","lv":0,"c":"strength","m":["glutes"],"s":"hip","p":1,"m2":["hamstrings"],"f":"bridge","ax":1,"nd":["exball"]},{"id":"Pin_Presses","n":"Pin Presses","lv":1,"c":"powerlifting","m":["triceps"],"s":"triceps","p":1,"m2":["chest","forearms","lats","middle back","shoulders"],"f":"benchPress","o":{"load":"bb","inc":"flat"},"nd":["barbell","bench","rack"]},{"id":"Piriformis-SMR","n":"Piriformis-SMR","lv":1,"c":"stretching","m":["glutes"],"s":"stretch","p":1,"f":"smr","o":{"pos":"seated"},"nd":["foamroll"]},{"id":"Plank","n":"Plank","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":3,"f":"plank","o":{"v":"full"}},{"id":"Plate_Pinch","n":"Plate Pinch","lv":1,"c":"strength","m":["forearms"],"s":"none","p":1,"nd":["plate"]},{"id":"Plate_Twist","n":"Plate Twist","lv":1,"c":"strength","m":["abdominals"],"s":"core","p":0,"f":"twist","nd":["plate"]},{"id":"Platform_Hamstring_Slides","n":"Platform Hamstring Slides","lv":0,"c":"strength","m":["hamstrings"],"s":"none","p":0,"m2":["glutes"],"nd":["other"]},{"id":"Plie_Dumbbell_Squat","n":"Plie Dumbbell Squat","lv":0,"c":"strength","m":["quadriceps"],"s":"knee","p":2,"m2":["abdominals","calves","glutes","hamstrings"],"f":"squat","o":{"load":"goblet"},"nd":["dumbbell"]},{"id":"Plyo_Kettlebell_Pushups","n":"Plyo Kettlebell Pushups","lv":2,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["shoulders","triceps"],"f":"pushup","o":{"v":"full"},"ax":1,"nd":["kettlebell"]},{"id":"Plyo_Push-up","n":"Plyo Push-up","lv":0,"c":"plyometrics","m":["chest"],"s":"hpush","p":1,"m2":["shoulders","triceps"],"f":"pushup","ax":1},{"id":"Posterior_Tibialis_Stretch","n":"Posterior Tibialis Stretch","lv":1,"c":"stretching","m":["calves"],"s":"stretch","p":1,"f":"calf","ax":1,"u":"side"},{"id":"Power_Clean","n":"Power Clean","lv":1,"c":"strength","m":["hamstrings"],"s":"olympic","p":1,"m2":["calves","forearms","glutes","lower back","middle back","quadriceps","shoulders","traps","triceps"],"f":"clean","o":{"load":"bb"},"nd":["barbell"]},{"id":"Power_Clean_from_Blocks","n":"Power Clean from Blocks","lv":1,"c":"olympic weightlifting","m":["hamstrings"],"s":"olympic","p":1,"m2":["quadriceps"],"f":"clean","o":{"load":"bb","hang":1},"nd":["barbell","rack"]},{"id":"Power_Jerk","n":"Power Jerk","lv":2,"c":"olympic weightlifting","m":["quadriceps"],"s":"olympic","p":1,"m2":["abdominals","calves","glutes","hamstrings","shoulders","triceps"],"f":"jerk","o":{"load":"bb"},"nd":["barbell"]},{"id":"Power_Partials","n":"Power Partials","lv":0,"c":"strength","m":["shoulders"],"s":"delts","p":0,"f":"lateralRaise","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Power_Snatch","n":"Power Snatch","lv":2,"c":"olympic weightlifting","m":["hamstrings"],"s":"olympic","p":1,"m2":["calves","glutes","lower back","quadriceps","shoulders","traps","triceps"],"f":"snatch","o":{"load":"bb"},"nd":["barbell"]},{"id":"Power_Snatch_from_Blocks","n":"Power Snatch from Blocks","lv":1,"c":"olympic weightlifting","m":["quadriceps"],"s":"olympic","p":1,"m2":["calves","forearms","glutes","hamstrings","lower back","shoulders","traps","triceps"],"f":"snatch","o":{"load":"bb","hang":1},"nd":["barbell","rack"]},{"id":"Power_Stairs","n":"Power Stairs","lv":1,"c":"strongman","m":["hamstrings"],"s":"none","p":0,"m2":["adductors","calves","glutes","lower back","quadriceps","shoulders","traps"],"nd":["other"]},{"id":"Preacher_Curl","n":"Preacher Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":2,"f":"curl","o":{"load":"bb","pos":"preacher"},"nd":["barbell","machine"]},{"id":"Preacher_Hammer_Dumbbell_Curl","n":"Preacher Hammer Dumbbell Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":1,"m2":["forearms"],"f":"curl","o":{"load":"db","pos":"preacher"},"nd":["dumbbell","machine"]},{"id":"Press_Sit-Up","n":"Press Sit-Up","lv":2,"c":"strength","m":["abdominals"],"s":"core","p":0,"m2":["chest","shoulders","triceps"],"f":"situp","o":{"load":"bb"},"nd":["barbell"]},{"id":"Prone_Manual_Hamstring","n":"Prone Manual Hamstring","lv":0,"c":"strength","m":["hamstrings"],"s":"none","p":1},{"id":"Prowler_Sprint","n":"Prowler Sprint","lv":0,"c":"cardio","m":["hamstrings"],"s":"none","p":0,"m2":["calves","chest","glutes","quadriceps","shoulders"],"nd":["sled"]},{"id":"Pull_Through","n":"Pull Through","lv":0,"c":"strength","m":["glutes"],"s":"hip","p":3,"m2":["hamstrings","lower back"],"f":"pullThrough","o":{"load":"cable"},"nd":["cable"]},{"id":"Pullups","n":"Pull-Up","lv":0,"c":"strength","m":["lats"],"s":"vpull","p":3,"a":"Pullups","m2":["biceps","middle back"],"f":"pullUp","nd":["pullupbar"]},{"id":"Push-Up_Wide","n":"Push-Up Wide","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["abdominals","shoulders","triceps"],"f":"pushup","o":{"v":"full"}},{"id":"Push-Ups_-_Close_Triceps_Position","n":"Close-Grip Push-Up","lv":1,"c":"strength","m":["triceps"],"s":"triceps","p":3,"a":"Push-Ups - Close Triceps Position","m2":["chest","shoulders"],"f":"pushup","o":{"v":"full"}},{"id":"Push-Ups_With_Feet_Elevated","n":"Push-Ups With Feet Elevated","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["shoulders","triceps"],"f":"pushup","o":{"v":"decline"}},{"id":"Push-Ups_With_Feet_On_An_Exercise_Ball","n":"Push-Ups With Feet On An Exercise Ball","lv":1,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["shoulders","triceps"],"f":"pushup","o":{"v":"decline"},"nd":["exball"]},{"id":"Push_Press","n":"Push Press","lv":2,"c":"olympic weightlifting","m":["shoulders"],"s":"vpush","p":1,"m2":["quadriceps","triceps"],"f":"ohPress","o":{"load":"bb"},"ax":1,"nd":["barbell"]},{"id":"Push_Press_-_Behind_the_Neck","n":"Push Press - Behind the Neck","lv":1,"c":"olympic weightlifting","m":["shoulders"],"s":"vpush","p":1,"m2":["calves","quadriceps","triceps"],"f":"ohPress","o":{"load":"bb"},"ax":1,"nd":["barbell"]},{"id":"Push_Up_to_Side_Plank","n":"Push Up to Side Plank","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["abdominals","shoulders","triceps"],"f":"pushup","o":{"v":"full"},"ax":1},{"id":"Pushups","n":"Push-Up","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":3,"a":"Pushups","m2":["shoulders","triceps"],"f":"pushup","o":{"v":"full"}},{"id":"Pushups_Close_and_Wide_Hand_Positions","n":"Pushups (Close and Wide Hand Positions)","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":0,"m2":["shoulders","triceps"],"f":"pushup","o":{"v":"full"}},{"id":"Pyramid","n":"Pyramid","lv":0,"c":"stretching","m":["lower back"],"s":"none","p":1,"m2":["shoulders"],"nd":["exball"]},{"id":"Quad_Stretch","n":"Standing Quad Stretch","lv":1,"c":"stretching","m":["quadriceps"],"s":"stretch","p":3,"a":"Quad Stretch","f":"stQuad","u":"side"},{"id":"Quadriceps-SMR","n":"Quadriceps-SMR","lv":1,"c":"stretching","m":["quadriceps"],"s":"stretch","p":1,"f":"smr","o":{"pos":"prone"},"nd":["foamroll"]},{"id":"Quick_Leap","n":"Quick Leap","lv":0,"c":"plyometrics","m":["quadriceps"],"s":"plyo","p":0,"m2":["calves","hamstrings"],"f":"jump","ax":1,"nd":["other"]},{"id":"Rack_Delivery","n":"Rack Delivery","lv":1,"c":"olympic weightlifting","m":["shoulders"],"s":"none","p":1,"m2":["forearms","traps"],"nd":["barbell"]},{"id":"Rack_Pull_with_Bands","n":"Rack Pull with Bands","lv":1,"c":"powerlifting","m":["lower back"],"s":"hip","p":1,"m2":["forearms","glutes","hamstrings","quadriceps","traps"],"f":"deadlift","o":{"load":"bb","style":"rack"},"nd":["bands","barbell","rack"]},{"id":"Rack_Pulls","n":"Rack Pulls","lv":1,"c":"powerlifting","m":["lower back"],"s":"hip","p":1,"m2":["forearms","glutes","hamstrings","traps"],"f":"deadlift","o":{"load":"bb","style":"rack"},"nd":["barbell","rack"]},{"id":"Rear_Leg_Raises","n":"Rear Leg Lifts","lv":0,"c":"stretching","m":["quadriceps"],"s":"stretch","p":2,"a":"Rear Leg Raises","f":"legSwing","o":{"dir":"back"},"u":"side"},{"id":"Recumbent_Bike","n":"Recumbent Bike","lv":0,"c":"cardio","m":["quadriceps"],"s":"cardio","p":2,"m2":["calves","glutes","hamstrings"],"f":"bike","nd":["cardio"]},{"id":"Return_Push_from_Stance","n":"Return Push from Stance","lv":0,"c":"plyometrics","m":["shoulders"],"s":"plyo","p":1,"m2":["chest","triceps"],"f":"chestPass","nd":["medball"]},{"id":"Reverse_Band_Bench_Press","n":"Reverse Band Bench Press","lv":1,"c":"powerlifting","m":["triceps"],"s":"triceps","p":1,"m2":["chest","forearms","lats","middle back","shoulders"],"f":"benchPress","o":{"load":"bb","inc":"flat"},"nd":["bands","barbell","bench"]},{"id":"Reverse_Band_Box_Squat","n":"Reverse Band Box Squat","lv":1,"c":"powerlifting","m":["quadriceps"],"s":"knee","p":1,"m2":["abductors","adductors","calves","forearms","glutes","hamstrings","lower back"],"f":"squat","o":{"load":"bbBack","box":1},"nd":["bands","barbell","box"]},{"id":"Reverse_Band_Deadlift","n":"Reverse Band Deadlift","lv":2,"c":"powerlifting","m":["lower back"],"s":"hip","p":1,"m2":["abductors","adductors","calves","glutes","hamstrings","quadriceps"],"f":"deadlift","o":{"load":"bb","style":"conv"},"nd":["bands","barbell"]},{"id":"Reverse_Band_Power_Squat","n":"Reverse Band Power Squat","lv":2,"c":"powerlifting","m":["quadriceps"],"s":"knee","p":1,"m2":["adductors","calves","glutes","hamstrings","lower back"],"f":"squat","o":{"load":"bbBack"},"nd":["bands","barbell"]},{"id":"Reverse_Band_Sumo_Deadlift","n":"Reverse Band Sumo Deadlift","lv":2,"c":"powerlifting","m":["hamstrings"],"s":"hip","p":1,"m2":["abductors","adductors","calves","forearms","glutes","lower back","quadriceps","traps"],"f":"deadlift","o":{"load":"bb","style":"conv"},"nd":["bands","barbell"]},{"id":"Reverse_Barbell_Curl","n":"Reverse Barbell Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":1,"m2":["forearms"],"f":"curl","o":{"load":"bb","pos":"stand"},"nd":["barbell"]},{"id":"Reverse_Barbell_Preacher_Curls","n":"Reverse Barbell Preacher Curls","lv":1,"c":"strength","m":["biceps"],"s":"biceps","p":1,"m2":["forearms"],"f":"curl","o":{"load":"bb","pos":"preacher"},"nd":["barbell","machine"]},{"id":"Reverse_Cable_Curl","n":"Reverse Cable Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":1,"m2":["forearms"],"f":"curl","o":{"load":"cable","pos":"stand"},"nd":["cable"]},{"id":"Reverse_Crunch","n":"Reverse Crunch","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":3,"f":"legRaise"},{"id":"Reverse_Flyes","n":"Dumbbell Reverse Fly","lv":0,"c":"strength","m":["shoulders"],"s":"rear","p":3,"a":"Reverse Flyes","f":"reverseFly","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Reverse_Flyes_With_External_Rotation","n":"Reverse Flyes With External Rotation","lv":1,"c":"strength","m":["shoulders"],"s":"rear","p":1,"f":"reverseFly","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Reverse_Grip_Bent-Over_Rows","n":"Reverse Grip Bent-Over Rows","lv":1,"c":"strength","m":["middle back"],"s":"hpull","p":1,"m2":["biceps","lats","shoulders"],"f":"bentRow","o":{"load":"bb"},"nd":["barbell"]},{"id":"Reverse_Grip_Triceps_Pushdown","n":"Reverse Grip Triceps Pushdown","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":1,"f":"pushdown","o":{"load":"cable"},"nd":["cable"]},{"id":"Reverse_Hyperextension","n":"Reverse Hyperextension","lv":1,"c":"strength","m":["hamstrings"],"s":"none","p":1,"m2":["calves","glutes"],"nd":["machine"]},{"id":"Reverse_Machine_Flyes","n":"Reverse Machine Flyes","lv":0,"c":"strength","m":["shoulders"],"s":"rear","p":3,"f":"reverseFly","o":{"load":"machine","seat":1},"nd":["machine"]},{"id":"Reverse_Plate_Curls","n":"Reverse Plate Curls","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":1,"m2":["forearms"],"f":"curl","o":{"pos":"stand"},"nd":["plate"]},{"id":"Reverse_Triceps_Bench_Press","n":"Reverse Triceps Bench Press","lv":1,"c":"strength","m":["triceps"],"s":"triceps","p":1,"m2":["chest","shoulders"],"f":"benchPress","o":{"load":"bb","inc":"flat"},"nd":["barbell","bench"]},{"id":"Rhomboids-SMR","n":"Rhomboids-SMR","lv":1,"c":"stretching","m":["middle back"],"s":"stretch","p":1,"m2":["traps"],"f":"smr","o":{"pos":"supine"},"nd":["foamroll"]},{"id":"Rickshaw_Carry","n":"Rickshaw Carry","lv":1,"c":"strongman","m":["forearms"],"s":"carry","p":0,"m2":["abdominals","calves","glutes","hamstrings","lower back","quadriceps","traps"],"f":"carry","nd":["other"]},{"id":"Rickshaw_Deadlift","n":"Rickshaw Deadlift","lv":1,"c":"strongman","m":["quadriceps"],"s":"hip","p":0,"m2":["forearms","glutes","hamstrings","lower back","traps"],"f":"deadlift","o":{"load":"bb"},"nd":["other"]},{"id":"Ring_Dips","n":"Ring Dips","lv":1,"c":"strength","m":["triceps"],"s":"triceps","p":1,"m2":["chest","shoulders"],"f":"dip","o":{"v":"bars"},"nd":["dipbars","trx"]},{"id":"Rocket_Jump","n":"Rocket Jump","lv":0,"c":"plyometrics","m":["quadriceps"],"s":"plyo","p":2,"m2":["calves","hamstrings"],"f":"jump"},{"id":"Rocking_Standing_Calf_Raise","n":"Rocking Standing Calf Raise","lv":0,"c":"strength","m":["calves"],"s":"calves","p":1,"f":"calfRaise","o":{"load":"bb"},"nd":["barbell"]},{"id":"Rocky_Pull-Ups_Pulldowns","n":"Rocky Pull-Ups/Pulldowns","lv":1,"c":"strength","m":["lats"],"s":"vpull","p":0,"m2":["biceps","middle back","shoulders"],"f":"pulldown","ax":1,"nd":["pullupbar"]},{"id":"Romanian_Deadlift","n":"Romanian Deadlift","lv":1,"c":"strength","m":["hamstrings"],"s":"hip","p":3,"m2":["calves","glutes","lower back"],"f":"deadlift","o":{"load":"bb","style":"stiff"},"nd":["barbell"]},{"id":"Romanian_Deadlift_from_Deficit","n":"Romanian Deadlift from Deficit","lv":1,"c":"olympic weightlifting","m":["hamstrings"],"s":"hip","p":0,"m2":["forearms","glutes","lower back","traps"],"f":"deadlift","o":{"load":"bb","style":"stiff"},"nd":["barbell"]},{"id":"Rope_Climb","n":"Rope Climb","lv":1,"c":"strength","m":["lats"],"s":"none","p":0,"m2":["biceps","forearms","middle back","shoulders"],"nd":["other"]},{"id":"Rope_Crunch","n":"Rope Crunch","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"cableCrunch","nd":["cable"]},{"id":"Rope_Jumping","n":"Jump Rope","lv":1,"c":"cardio","m":["quadriceps"],"s":"cardio","p":3,"a":"Rope Jumping","m2":["calves","hamstrings"],"f":"jumpRope","nd":["rope"]},{"id":"Rope_Straight-Arm_Pulldown","n":"Rope Straight-Arm Pulldown","lv":0,"c":"strength","m":["lats"],"s":"vpull","p":1,"f":"armPulldown","o":{"load":"cable"},"nd":["cable"]},{"id":"Round_The_World_Shoulder_Stretch","n":"Round The World Shoulder Stretch","lv":0,"c":"stretching","m":["shoulders"],"s":"stretch","p":1,"m2":["biceps","chest"],"f":"stCrossArm","ax":1,"u":"side"},{"id":"Rowing_Stationary","n":"Rowing Machine","lv":1,"c":"cardio","m":["quadriceps"],"s":"cardio","p":3,"a":"Rowing, Stationary","m2":["biceps","calves","glutes","hamstrings","lower back","middle back"],"f":"rower","nd":["cardio"]},{"id":"Runners_Stretch","n":"Runner's Stretch","lv":0,"c":"stretching","m":["hamstrings"],"s":"stretch","p":1,"m2":["calves"],"f":"stHipFlexor","u":"side"},{"id":"Running_Treadmill","n":"Treadmill Run","lv":0,"c":"cardio","m":["quadriceps"],"s":"cardio","p":3,"a":"Running, Treadmill","m2":["calves","glutes","hamstrings"],"f":"run","nd":["cardio"]},{"id":"Russian_Twist","n":"Russian Twist","lv":1,"c":"strength","m":["abdominals"],"s":"core","p":2,"m2":["lower back"],"f":"twist"},{"id":"Sandbag_Load","n":"Sandbag Load","lv":0,"c":"strongman","m":["quadriceps"],"s":"none","p":0,"m2":["abdominals","biceps","calves","forearms","glutes","hamstrings","lower back","middle back","shoulders","traps"],"nd":["other"]},{"id":"Scapular_Pull-Up","n":"Scapular Pull-Up","lv":0,"c":"strength","m":["traps"],"s":"vpull","p":1,"m2":["lats","middle back"],"f":"pullUp","ax":1,"nd":["pullupbar"]},{"id":"Scissor_Kick","n":"Scissor Kick","lv":0,"c":"stretching","m":["abdominals"],"s":"core","p":2,"f":"legRaise","o":{"flutter":1},"u":"alt"},{"id":"Scissors_Jump","n":"Scissors Jump","lv":0,"c":"plyometrics","m":["quadriceps"],"s":"plyo","p":1,"m2":["glutes","hamstrings"],"f":"lungeJump"},{"id":"Seated_Band_Hamstring_Curl","n":"Seated Band Hamstring Curl","lv":0,"c":"strength","m":["hamstrings"],"s":"hipIso","p":1,"f":"legCurl","o":{"pos":"seated"},"nd":["bands"]},{"id":"Seated_Barbell_Military_Press","n":"Seated Barbell Military Press","lv":1,"c":"strength","m":["shoulders"],"s":"vpush","p":2,"m2":["triceps"],"f":"ohPress","o":{"load":"bb","seat":1},"nd":["barbell"]},{"id":"Seated_Barbell_Twist","n":"Seated Barbell Twist","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":0,"f":"twist","o":{"load":"bb"},"nd":["barbell"]},{"id":"Seated_Bent-Over_One-Arm_Dumbbell_Triceps_Extension","n":"Seated Bent-Over One-Arm Dumbbell Triceps Extension","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":1,"f":"triKickback","o":{"load":"db"},"nd":["dumbbell"],"u":"side"},{"id":"Seated_Bent-Over_Rear_Delt_Raise","n":"Seated Bent-Over Rear Delt Raise","lv":1,"c":"strength","m":["shoulders"],"s":"rear","p":2,"f":"reverseFly","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Seated_Bent-Over_Two-Arm_Dumbbell_Triceps_Extension","n":"Seated Bent-Over Two-Arm Dumbbell Triceps Extension","lv":1,"c":"strength","m":["triceps"],"s":"triceps","p":1,"f":"triKickback","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Seated_Biceps","n":"Seated Biceps","lv":2,"c":"stretching","m":["biceps"],"s":"stretch","p":1,"m2":["chest","shoulders"],"f":"stChest","ax":1},{"id":"Seated_Cable_Rows","n":"Seated Cable Row","lv":0,"c":"strength","m":["middle back"],"s":"hpull","p":3,"a":"Seated Cable Rows","m2":["biceps","lats","shoulders"],"f":"seatedRow","o":{"load":"cable"},"nd":["cable"]},{"id":"Seated_Cable_Shoulder_Press","n":"Seated Cable Shoulder Press","lv":0,"c":"strength","m":["shoulders"],"s":"vpush","p":1,"m2":["triceps"],"f":"ohPress","o":{"load":"cable","seat":1},"nd":["cable"]},{"id":"Seated_Calf_Raise","n":"Seated Calf Raise","lv":0,"c":"strength","m":["calves"],"s":"calves","p":2,"f":"calfRaise","o":{"load":"machine","seated":1},"nd":["machine"]},{"id":"Seated_Calf_Stretch","n":"Seated Calf Stretch","lv":0,"c":"stretching","m":["calves"],"s":"stretch","p":1,"m2":["hamstrings","lower back"],"f":"stSeatReach"},{"id":"Seated_Close-Grip_Concentration_Barbell_Curl","n":"Seated Close-Grip Concentration Barbell Curl","lv":1,"c":"strength","m":["biceps"],"s":"biceps","p":1,"f":"curl","o":{"load":"bb","pos":"conc"},"nd":["barbell"]},{"id":"Seated_Dumbbell_Curl","n":"Seated Dumbbell Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":2,"f":"curl","o":{"load":"db","pos":"seat"},"nd":["dumbbell"]},{"id":"Seated_Dumbbell_Inner_Biceps_Curl","n":"Seated Dumbbell Inner Biceps Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":1,"f":"curl","o":{"load":"db","pos":"seat"},"nd":["dumbbell"]},{"id":"Seated_Dumbbell_Palms-Down_Wrist_Curl","n":"Seated Dumbbell Palms-Down Wrist Curl","lv":0,"c":"strength","m":["forearms"],"s":"forearms","p":1,"f":"wristCurl","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Seated_Dumbbell_Palms-Up_Wrist_Curl","n":"Seated Dumbbell Palms-Up Wrist Curl","lv":0,"c":"strength","m":["forearms"],"s":"forearms","p":1,"f":"wristCurl","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Seated_Dumbbell_Press","n":"Seated Dumbbell Press","lv":0,"c":"strength","m":["shoulders"],"s":"vpush","p":3,"m2":["triceps"],"f":"ohPress","o":{"load":"db","seat":1},"nd":["dumbbell"]},{"id":"Seated_Flat_Bench_Leg_Pull-In","n":"Seated Flat Bench Leg Pull-In","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"legRaise","ax":1,"nd":["bench"]},{"id":"Seated_Floor_Hamstring_Stretch","n":"Seated Floor Hamstring Stretch","lv":0,"c":"stretching","m":["hamstrings"],"s":"stretch","p":3,"m2":["calves"],"f":"stSeatReach"},{"id":"Seated_Front_Deltoid","n":"Seated Front Deltoid","lv":2,"c":"stretching","m":["shoulders"],"s":"stretch","p":1,"m2":["chest"],"f":"stChest","ax":1},{"id":"Seated_Glute","n":"Seated Glute","lv":2,"c":"stretching","m":["glutes"],"s":"stretch","p":1,"m2":["adductors"],"f":"stSeatTwist","ax":1,"u":"side"},{"id":"Seated_Good_Mornings","n":"Seated Good Mornings","lv":1,"c":"powerlifting","m":["lower back"],"s":"hip","p":0,"m2":["glutes"],"f":"goodMorning","o":{"load":"bb"},"ax":1,"nd":["barbell"]},{"id":"Seated_Hamstring","n":"Seated Hamstring","lv":2,"c":"stretching","m":["hamstrings"],"s":"stretch","p":1,"m2":["calves"],"f":"stSeatReach"},{"id":"Seated_Hamstring_and_Calf_Stretch","n":"Seated Hamstring and Calf Stretch","lv":1,"c":"stretching","m":["hamstrings"],"s":"stretch","p":1,"m2":["calves"],"f":"stSeatReach"},{"id":"Seated_Head_Harness_Neck_Resistance","n":"Seated Head Harness Neck Resistance","lv":1,"c":"strength","m":["neck"],"s":"none","p":0,"nd":["other"]},{"id":"Seated_Leg_Curl","n":"Seated Leg Curl","lv":0,"c":"strength","m":["hamstrings"],"s":"hipIso","p":3,"f":"legCurl","o":{"pos":"seated"},"nd":["machine"]},{"id":"Seated_Leg_Tucks","n":"Seated Leg Tucks","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"legRaise","ax":1},{"id":"Seated_One-Arm_Dumbbell_Palms-Down_Wrist_Curl","n":"Seated One-Arm Dumbbell Palms-Down Wrist Curl","lv":1,"c":"strength","m":["forearms"],"s":"forearms","p":1,"f":"wristCurl","o":{"load":"db"},"nd":["dumbbell"],"u":"side"},{"id":"Seated_One-Arm_Dumbbell_Palms-Up_Wrist_Curl","n":"Seated One-Arm Dumbbell Palms-Up Wrist Curl","lv":0,"c":"strength","m":["forearms"],"s":"forearms","p":1,"f":"wristCurl","o":{"load":"db"},"nd":["dumbbell"],"u":"side"},{"id":"Seated_One-arm_Cable_Pulley_Rows","n":"Seated One-arm Cable Pulley Rows","lv":1,"c":"strength","m":["middle back"],"s":"hpull","p":1,"m2":["biceps","lats","traps"],"f":"seatedRow","o":{"load":"cable"},"nd":["cable"],"u":"side"},{"id":"Seated_Overhead_Stretch","n":"Seated Overhead Stretch","lv":0,"c":"stretching","m":["abdominals"],"s":"stretch","p":1,"f":"stReach"},{"id":"Seated_Palm-Up_Barbell_Wrist_Curl","n":"Seated Palm-Up Barbell Wrist Curl","lv":0,"c":"strength","m":["forearms"],"s":"forearms","p":1,"f":"wristCurl","o":{"load":"bb"},"nd":["barbell"]},{"id":"Seated_Palms-Down_Barbell_Wrist_Curl","n":"Seated Palms-Down Barbell Wrist Curl","lv":0,"c":"strength","m":["forearms"],"s":"forearms","p":1,"f":"wristCurl","o":{"load":"bb"},"nd":["barbell"]},{"id":"Seated_Side_Lateral_Raise","n":"Seated Side Lateral Raise","lv":0,"c":"strength","m":["shoulders"],"s":"delts","p":2,"f":"lateralRaise","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Seated_Triceps_Press","n":"Seated Triceps Press","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":2,"f":"overTri","o":{"load":"db","seat":1},"nd":["dumbbell"]},{"id":"Seated_Two-Arm_Palms-Up_Low-Pulley_Wrist_Curl","n":"Seated Two-Arm Palms-Up Low-Pulley Wrist Curl","lv":0,"c":"strength","m":["forearms"],"s":"forearms","p":1,"f":"wristCurl","o":{"load":"cable"},"nd":["cable"]},{"id":"See-Saw_Press_Alternating_Side_Press","n":"See-Saw Press (Alternating Side Press)","lv":1,"c":"strength","m":["shoulders"],"s":"vpush","p":1,"m2":["abdominals","triceps"],"f":"ohPress","o":{"load":"db"},"nd":["dumbbell"],"u":"alt"},{"id":"Shotgun_Row","n":"Shotgun Row","lv":0,"c":"strength","m":["lats"],"s":"hpull","p":1,"m2":["biceps","middle back"],"f":"row","o":{"load":"cable"},"nd":["cable"]},{"id":"Shoulder_Circles","n":"Shoulder Circles","lv":0,"c":"stretching","m":["shoulders"],"s":"stretch","p":1,"m2":["traps"],"f":"armCircles","ax":1},{"id":"Shoulder_Press_-_With_Bands","n":"Band Overhead Press","lv":0,"c":"strength","m":["shoulders"],"s":"vpush","p":3,"a":"Shoulder Press - With Bands","m2":["triceps"],"f":"ohPress","o":{"load":"band"},"nd":["bands"]},{"id":"Shoulder_Raise","n":"Shoulder Raise","lv":0,"c":"stretching","m":["shoulders"],"s":"stretch","p":0,"m2":["lats"],"f":"shrug"},{"id":"Shoulder_Stretch","n":"Cross-Arm Shoulder Stretch","lv":0,"c":"stretching","m":["shoulders"],"s":"stretch","p":3,"a":"Shoulder Stretch","f":"stCrossArm","u":"side"},{"id":"Side-Lying_Floor_Stretch","n":"Side-Lying Floor Stretch","lv":0,"c":"stretching","m":["lats"],"s":"stretch","p":1,"f":"stTwistLying","ax":1,"u":"side"},{"id":"Side_Bridge","n":"Side Plank","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":3,"a":"Side Bridge","m2":["shoulders"],"f":"sidePlank","u":"side"},{"id":"Side_Hop-Sprint","n":"Side Hop-Sprint","lv":0,"c":"plyometrics","m":["quadriceps"],"s":"plyo","p":0,"m2":["abductors","adductors","calves","hamstrings"],"f":"lateralHop","nd":["other"]},{"id":"Side_Jackknife","n":"Side Jackknife","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"vup","ax":1},{"id":"Side_Lateral_Raise","n":"Dumbbell Lateral Raise","lv":0,"c":"strength","m":["shoulders"],"s":"delts","p":3,"a":"Side Lateral Raise","f":"lateralRaise","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Side_Laterals_to_Front_Raise","n":"Side Laterals to Front Raise","lv":0,"c":"strength","m":["shoulders"],"s":"delts","p":1,"m2":["traps"],"f":"lateralRaise","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Side_Leg_Raises","n":"Side Leg Lifts","lv":0,"c":"stretching","m":["adductors"],"s":"stretch","p":2,"a":"Side Leg Raises","f":"legSwing","o":{"dir":"side"},"u":"side"},{"id":"Side_Lying_Groin_Stretch","n":"Side Lying Groin Stretch","lv":0,"c":"stretching","m":["adductors"],"s":"stretch","p":1,"m2":["hamstrings"],"f":"stSideLunge","ax":1,"u":"side"},{"id":"Side_Neck_Stretch","n":"Side Neck Stretch","lv":0,"c":"stretching","m":["neck"],"s":"stretch","p":3,"f":"stNeck","u":"side"},{"id":"Side_Standing_Long_Jump","n":"Side Standing Long Jump","lv":0,"c":"plyometrics","m":["quadriceps"],"s":"plyo","p":1,"m2":["calves","glutes","hamstrings"],"f":"jump","ax":1},{"id":"Side_To_Side_Chins","n":"Side To Side Chins","lv":1,"c":"strength","m":["lats"],"s":"vpull","p":1,"m2":["biceps","forearms","middle back","shoulders"],"f":"pullUp","ax":1,"nd":["pullupbar"]},{"id":"Side_Wrist_Pull","n":"Side Wrist Pull","lv":0,"c":"stretching","m":["shoulders"],"s":"stretch","p":1,"m2":["forearms","lats"],"f":"stCrossArm","ax":1,"u":"side"},{"id":"Side_to_Side_Box_Shuffle","n":"Side to Side Box Shuffle","lv":0,"c":"plyometrics","m":["quadriceps"],"s":"plyo","p":1,"m2":["abductors","adductors","calves","hamstrings"],"f":"lateralHop","nd":["box"]},{"id":"Single-Arm_Cable_Crossover","n":"Single-Arm Cable Crossover","lv":0,"c":"strength","m":["chest"],"s":"chestIso","p":1,"f":"fly","o":{"load":"cable","pos":"stand"},"nd":["cable"],"u":"side"},{"id":"Single-Arm_Linear_Jammer","n":"Single-Arm Linear Jammer","lv":1,"c":"strength","m":["shoulders"],"s":"none","p":1,"m2":["chest","triceps"],"nd":["barbell"],"u":"side"},{"id":"Single-Arm_Push-Up","n":"Single-Arm Push-Up","lv":1,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["shoulders","triceps"],"f":"pushup","o":{"v":"full"},"ax":1,"u":"side"},{"id":"Single-Cone_Sprint_Drill","n":"Single-Cone Sprint Drill","lv":0,"c":"plyometrics","m":["quadriceps"],"s":"cardio","p":0,"m2":["calves","glutes","hamstrings"],"f":"run","ax":1,"nd":["other"]},{"id":"Single-Leg_High_Box_Squat","n":"Single-Leg High Box Squat","lv":0,"c":"strength","m":["quadriceps"],"s":"none","p":1,"m2":["glutes","hamstrings"],"nd":["box"],"u":"side"},{"id":"Single-Leg_Hop_Progression","n":"Single-Leg Hop Progression","lv":0,"c":"plyometrics","m":["quadriceps"],"s":"plyo","p":0,"m2":["abductors","adductors","calves","hamstrings"],"f":"jump","ax":1,"nd":["other"],"u":"side"},{"id":"Single-Leg_Lateral_Hop","n":"Single-Leg Lateral Hop","lv":0,"c":"plyometrics","m":["quadriceps"],"s":"plyo","p":0,"m2":["abductors","adductors","calves","hamstrings"],"f":"lateralHop","nd":["other"]},{"id":"Single-Leg_Leg_Extension","n":"Single-Leg Leg Extension","lv":0,"c":"strength","m":["quadriceps"],"s":"kneeIso","p":1,"f":"legExt","nd":["machine"],"u":"side"},{"id":"Single-Leg_Stride_Jump","n":"Single-Leg Stride Jump","lv":0,"c":"plyometrics","m":["quadriceps"],"s":"plyo","p":0,"m2":["abductors","adductors","calves","hamstrings"],"f":"jump","ax":1,"nd":["other"],"u":"side"},{"id":"Single_Dumbbell_Raise","n":"Single Dumbbell Raise","lv":0,"c":"strength","m":["shoulders"],"s":"delts","p":1,"m2":["forearms","traps"],"f":"frontRaise","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Single_Leg_Butt_Kick","n":"Single Leg Butt Kick","lv":0,"c":"plyometrics","m":["quadriceps"],"s":"plyo","p":1,"m2":["calves","hamstrings"],"f":"jump","u":"side"},{"id":"Single_Leg_Glute_Bridge","n":"Single Leg Glute Bridge","lv":0,"c":"strength","m":["glutes"],"s":"hip","p":2,"m2":["hamstrings"],"f":"bridge","o":{"single":1},"u":"side"},{"id":"Single_Leg_Push-off","n":"Single Leg Push-off","lv":0,"c":"plyometrics","m":["quadriceps"],"s":"plyo","p":0,"m2":["calves","hamstrings"],"f":"jump","ax":1,"nd":["other"],"u":"side"},{"id":"Sit-Up","n":"Sit-Up","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":2,"f":"situp"},{"id":"Sit_Squats","n":"Sit Squats","lv":0,"c":"stretching","m":["quadriceps"],"s":"knee","p":0,"m2":["abductors","glutes","hamstrings"],"f":"squat"},{"id":"Skating","n":"Skating","lv":1,"c":"cardio","m":["quadriceps"],"s":"none","p":0,"m2":["abductors","adductors","calves","glutes","hamstrings"],"nd":["other"]},{"id":"Sled_Drag_-_Harness","n":"Sled Drag - Harness","lv":0,"c":"strongman","m":["quadriceps"],"s":"none","p":0,"m2":["calves","glutes","hamstrings"],"nd":["sled"]},{"id":"Sled_Overhead_Backward_Walk","n":"Sled Overhead Backward Walk","lv":0,"c":"strength","m":["shoulders"],"s":"none","p":0,"m2":["calves","middle back","quadriceps"],"nd":["sled"]},{"id":"Sled_Overhead_Triceps_Extension","n":"Sled Overhead Triceps Extension","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":0,"f":"overTri","o":{"load":"cable"},"ax":1,"nd":["sled"]},{"id":"Sled_Push","n":"Sled Push","lv":0,"c":"strongman","m":["quadriceps"],"s":"none","p":0,"m2":["calves","chest","glutes","hamstrings","triceps"],"nd":["sled"]},{"id":"Sled_Reverse_Flye","n":"Sled Reverse Flye","lv":0,"c":"strength","m":["shoulders"],"s":"rear","p":0,"f":"reverseFly","ax":1,"nd":["sled"]},{"id":"Sled_Row","n":"Sled Row","lv":0,"c":"strength","m":["middle back"],"s":"hpull","p":0,"m2":["biceps","lats"],"f":"row","o":{"load":"cable"},"ax":1,"nd":["sled"]},{"id":"Sledgehammer_Swings","n":"Sledgehammer Swings","lv":0,"c":"plyometrics","m":["abdominals"],"s":"plyo","p":0,"m2":["calves","forearms","lats","middle back","shoulders"],"f":"ballSlam","ax":1,"nd":["other"]},{"id":"Smith_Incline_Shoulder_Raise","n":"Smith Incline Shoulder Raise","lv":0,"c":"strength","m":["shoulders"],"s":"none","p":1,"m2":["chest"],"nd":["barbell","bench","machine"]},{"id":"Smith_Machine_Behind_the_Back_Shrug","n":"Smith Machine Behind the Back Shrug","lv":0,"c":"strength","m":["traps"],"s":"traps","p":1,"m2":["shoulders"],"f":"shrug","o":{"load":"bb"},"nd":["machine"]},{"id":"Smith_Machine_Bench_Press","n":"Smith Machine Bench Press","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":2,"m2":["shoulders","triceps"],"f":"benchPress","o":{"load":"bb","inc":"flat"},"nd":["bench","machine"]},{"id":"Smith_Machine_Bent_Over_Row","n":"Smith Machine Bent Over Row","lv":0,"c":"strength","m":["middle back"],"s":"hpull","p":1,"m2":["biceps","lats","shoulders"],"f":"bentRow","o":{"load":"machine"},"nd":["machine"]},{"id":"Smith_Machine_Calf_Raise","n":"Smith Machine Calf Raise","lv":0,"c":"strength","m":["calves"],"s":"calves","p":1,"f":"calfRaise","o":{"load":"machine"},"nd":["machine"]},{"id":"Smith_Machine_Close-Grip_Bench_Press","n":"Smith Machine Close-Grip Bench Press","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":1,"m2":["chest","shoulders"],"f":"benchPress","o":{"load":"bb","inc":"flat"},"nd":["bench","machine"]},{"id":"Smith_Machine_Decline_Press","n":"Smith Machine Decline Press","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["shoulders","triceps"],"f":"benchPress","o":{"load":"bb","inc":"decline"},"nd":["bench","machine"]},{"id":"Smith_Machine_Hang_Power_Clean","n":"Smith Machine Hang Power Clean","lv":1,"c":"strength","m":["hamstrings"],"s":"olympic","p":1,"m2":["glutes","lower back","quadriceps","shoulders","traps"],"f":"clean","o":{"load":"bb","hang":1},"nd":["machine"]},{"id":"Smith_Machine_Hip_Raise","n":"Smith Machine Hip Raise","lv":0,"c":"strength","m":["abdominals"],"s":"none","p":1,"nd":["machine"]},{"id":"Smith_Machine_Incline_Bench_Press","n":"Smith Machine Incline Bench Press","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["shoulders","triceps"],"f":"benchPress","o":{"load":"bb","inc":"incline"},"nd":["bench","machine"]},{"id":"Smith_Machine_Leg_Press","n":"Smith Machine Leg Press","lv":1,"c":"strength","m":["quadriceps"],"s":"knee","p":1,"m2":["calves","glutes","hamstrings"],"f":"legPress","nd":["machine"]},{"id":"Smith_Machine_One-Arm_Upright_Row","n":"Smith Machine One-Arm Upright Row","lv":0,"c":"strength","m":["shoulders"],"s":"delts","p":1,"m2":["biceps","traps"],"f":"uprightRow","o":{"load":"bb"},"nd":["machine"],"u":"side"},{"id":"Smith_Machine_Overhead_Shoulder_Press","n":"Smith Machine Overhead Shoulder Press","lv":0,"c":"strength","m":["shoulders"],"s":"vpush","p":2,"m2":["triceps"],"f":"ohPress","o":{"load":"machine"},"nd":["machine"]},{"id":"Smith_Machine_Pistol_Squat","n":"Smith Machine Pistol Squat","lv":1,"c":"strength","m":["quadriceps"],"s":"none","p":1,"m2":["calves","glutes","hamstrings"],"nd":["machine"]},{"id":"Smith_Machine_Reverse_Calf_Raises","n":"Smith Machine Reverse Calf Raises","lv":0,"c":"strength","m":["calves"],"s":"calves","p":1,"f":"calfRaise","o":{"load":"machine"},"nd":["machine"]},{"id":"Smith_Machine_Squat","n":"Smith Machine Squat","lv":0,"c":"strength","m":["quadriceps"],"s":"knee","p":2,"m2":["calves","glutes","hamstrings","lower back"],"f":"squat","o":{"load":"bbBack"},"nd":["machine"]},{"id":"Smith_Machine_Stiff-Legged_Deadlift","n":"Smith Machine Stiff-Legged Deadlift","lv":0,"c":"strength","m":["hamstrings"],"s":"hip","p":1,"m2":["glutes","lower back"],"f":"deadlift","o":{"load":"machine","style":"stiff"},"nd":["machine"]},{"id":"Smith_Machine_Upright_Row","n":"Smith Machine Upright Row","lv":0,"c":"strength","m":["traps"],"s":"delts","p":1,"m2":["biceps","middle back","shoulders"],"f":"uprightRow","o":{"load":"bb"},"nd":["machine"]},{"id":"Smith_Single-Leg_Split_Squat","n":"Smith Single-Leg Split Squat","lv":0,"c":"strength","m":["quadriceps"],"s":"knee","p":1,"m2":["calves","glutes","hamstrings"],"f":"lunge","o":{"load":"machine","mode":"bulgarian"},"nd":["machine"],"u":"side"},{"id":"Snatch","n":"Snatch","lv":1,"c":"olympic weightlifting","m":["quadriceps"],"s":"olympic","p":1,"m2":["biceps","glutes","hamstrings","lower back","shoulders","traps","triceps"],"f":"snatch","o":{"load":"bb"},"nd":["barbell"]},{"id":"Snatch_Balance","n":"Snatch Balance","lv":1,"c":"olympic weightlifting","m":["quadriceps"],"s":"knee","p":0,"m2":["calves","glutes","hamstrings","shoulders","triceps"],"f":"squat","o":{"load":"oh"},"ax":1,"nd":["barbell"]},{"id":"Snatch_Deadlift","n":"Snatch Deadlift","lv":1,"c":"olympic weightlifting","m":["hamstrings"],"s":"hip","p":0,"m2":["forearms","glutes","hamstrings","lower back","quadriceps","traps"],"f":"deadlift","o":{"load":"bb","style":"conv"},"nd":["barbell"]},{"id":"Snatch_Pull","n":"Snatch Pull","lv":1,"c":"strength","m":["hamstrings"],"s":"olympic","p":1,"m2":["calves","glutes","lower back","quadriceps","traps"],"f":"highPull","o":{"load":"bb"},"nd":["barbell"]},{"id":"Snatch_Shrug","n":"Snatch Shrug","lv":1,"c":"olympic weightlifting","m":["traps"],"s":"traps","p":0,"m2":["forearms","shoulders"],"f":"shrug","o":{"load":"bb"},"nd":["barbell"]},{"id":"Snatch_from_Blocks","n":"Snatch from Blocks","lv":2,"c":"olympic weightlifting","m":["quadriceps"],"s":"olympic","p":1,"m2":["calves","forearms","glutes","hamstrings","lower back","shoulders","traps","triceps"],"f":"snatch","o":{"load":"bb","hang":1},"nd":["barbell","rack"]},{"id":"Speed_Band_Overhead_Triceps","n":"Band Overhead Triceps Extension","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":2,"a":"Speed Band Overhead Triceps","f":"overTri","o":{"load":"band"},"nd":["bands"]},{"id":"Speed_Box_Squat","n":"Speed Box Squat","lv":1,"c":"powerlifting","m":["quadriceps"],"s":"knee","p":0,"m2":["calves","glutes","hamstrings"],"f":"squat","o":{"load":"bbBack","box":1},"nd":["barbell","box"]},{"id":"Speed_Squats","n":"Speed Squats","lv":2,"c":"strength","m":["quadriceps"],"s":"knee","p":0,"m2":["calves","glutes","hamstrings","lower back"],"f":"squat","o":{"load":"bbBack"},"nd":["barbell"]},{"id":"Spell_Caster","n":"Spell Caster","lv":0,"c":"strength","m":["abdominals"],"s":"none","p":1,"m2":["glutes","shoulders"],"nd":["dumbbell"]},{"id":"Spider_Crawl","n":"Spider Crawl","lv":0,"c":"strength","m":["abdominals"],"s":"cardio","p":1,"m2":["chest","shoulders","triceps"],"f":"mountainClimber","ax":1},{"id":"Spider_Curl","n":"Spider Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":1,"f":"curl","o":{"load":"bb","pos":"preacher"},"nd":["barbell","bench"]},{"id":"Spinal_Stretch","n":"Seated Spinal Twist","lv":0,"c":"stretching","m":["middle back"],"s":"stretch","p":3,"a":"Spinal Stretch","m2":["lats","lower back","neck","traps"],"f":"stSeatTwist","u":"side"},{"id":"Split_Clean","n":"Split Clean","lv":1,"c":"olympic weightlifting","m":["quadriceps"],"s":"olympic","p":1,"m2":["calves","forearms","glutes","hamstrings","lower back","shoulders","traps"],"f":"clean","o":{"load":"bb"},"nd":["barbell"]},{"id":"Split_Jerk","n":"Split Jerk","lv":1,"c":"olympic weightlifting","m":["quadriceps"],"s":"olympic","p":1,"m2":["glutes","hamstrings","shoulders","triceps"],"f":"jerk","o":{"load":"bb"},"nd":["barbell"]},{"id":"Split_Jump","n":"Split Jump","lv":0,"c":"plyometrics","m":["quadriceps"],"s":"plyo","p":2,"m2":["calves","glutes","hamstrings"],"f":"lungeJump"},{"id":"Split_Snatch","n":"Split Snatch","lv":2,"c":"olympic weightlifting","m":["hamstrings"],"s":"olympic","p":1,"m2":["calves","forearms","glutes","hamstrings","lower back","quadriceps","shoulders","traps","triceps"],"f":"snatch","o":{"load":"bb"},"nd":["barbell"]},{"id":"Split_Squat_with_Dumbbells","n":"Dumbbell Bulgarian Split Squat","lv":0,"c":"strength","m":["quadriceps"],"s":"knee","p":3,"a":"Split Squat with Dumbbells","m2":["glutes","hamstrings"],"f":"lunge","o":{"load":"db","mode":"bulgarian"},"nd":["dumbbell"],"u":"side"},{"id":"Split_Squats","n":"Split Squats","lv":1,"c":"stretching","m":["hamstrings"],"s":"stretch","p":1,"m2":["calves","glutes","quadriceps"],"f":"stHipFlexor","u":"side"},{"id":"Squat_Jerk","n":"Squat Jerk","lv":2,"c":"strength","m":["quadriceps"],"s":"olympic","p":1,"m2":["calves","glutes","hamstrings","shoulders","triceps"],"f":"jerk","o":{"load":"bb"},"nd":["barbell"]},{"id":"Squat_with_Bands","n":"Squat with Bands","lv":1,"c":"powerlifting","m":["quadriceps"],"s":"knee","p":1,"m2":["adductors","calves","glutes","hamstrings","lower back"],"f":"squat","o":{"load":"bbBack"},"nd":["bands","barbell"]},{"id":"Squat_with_Chains","n":"Squat with Chains","lv":1,"c":"powerlifting","m":["quadriceps"],"s":"knee","p":1,"m2":["adductors","calves","glutes","hamstrings","lower back"],"f":"squat","o":{"load":"bbBack"},"nd":["barbell","rack"]},{"id":"Squat_with_Plate_Movers","n":"Squat with Plate Movers","lv":1,"c":"strength","m":["quadriceps"],"s":"knee","p":0,"m2":["abductors","adductors","calves","glutes","hamstrings"],"f":"squat","o":{"load":"bbBack"},"nd":["barbell"]},{"id":"Squats_-_With_Bands","n":"Band Squat","lv":0,"c":"strength","m":["quadriceps"],"s":"knee","p":3,"a":"Squats - With Bands","m2":["calves","glutes","hamstrings","lower back"],"f":"squat","o":{"load":"band"},"nd":["bands"]},{"id":"Stairmaster","n":"Stairmaster","lv":1,"c":"cardio","m":["quadriceps"],"s":"cardio","p":2,"m2":["calves","glutes","hamstrings"],"f":"stepUp","nd":["cardio"]},{"id":"Standing_Alternating_Dumbbell_Press","n":"Standing Alternating Dumbbell Press","lv":0,"c":"strength","m":["shoulders"],"s":"vpush","p":1,"m2":["triceps"],"f":"ohPress","o":{"load":"db"},"nd":["dumbbell"],"u":"alt"},{"id":"Standing_Barbell_Calf_Raise","n":"Standing Barbell Calf Raise","lv":0,"c":"strength","m":["calves"],"s":"calves","p":2,"f":"calfRaise","o":{"load":"bb"},"nd":["barbell"]},{"id":"Standing_Barbell_Press_Behind_Neck","n":"Standing Barbell Press Behind Neck","lv":1,"c":"strength","m":["shoulders"],"s":"vpush","p":0,"m2":["triceps"],"f":"ohPress","o":{"load":"bb"},"nd":["barbell"]},{"id":"Standing_Bent-Over_One-Arm_Dumbbell_Triceps_Extension","n":"Standing Bent-Over One-Arm Dumbbell Triceps Extension","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":1,"m2":["shoulders"],"f":"triKickback","o":{"load":"db"},"nd":["dumbbell"],"u":"side"},{"id":"Standing_Bent-Over_Two-Arm_Dumbbell_Triceps_Extension","n":"Standing Bent-Over Two-Arm Dumbbell Triceps Extension","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":1,"f":"triKickback","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Standing_Biceps_Cable_Curl","n":"Standing Biceps Cable Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":3,"f":"curl","o":{"load":"cable","pos":"stand"},"nd":["cable"]},{"id":"Standing_Biceps_Stretch","n":"Standing Biceps Stretch","lv":0,"c":"stretching","m":["biceps"],"s":"stretch","p":1,"m2":["chest","shoulders"],"f":"stChest","ax":1},{"id":"Standing_Bradford_Press","n":"Standing Bradford Press","lv":0,"c":"strength","m":["shoulders"],"s":"vpush","p":0,"m2":["triceps"],"f":"ohPress","o":{"load":"bb"},"nd":["barbell"]},{"id":"Standing_Cable_Chest_Press","n":"Standing Cable Chest Press","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":2,"m2":["shoulders","triceps"],"f":"standPress","o":{"load":"cable"},"nd":["cable"]},{"id":"Standing_Cable_Lift","n":"Standing Cable Lift","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"m2":["shoulders"],"f":"twist","o":{"load":"cable"},"ax":1,"nd":["cable"]},{"id":"Standing_Cable_Wood_Chop","n":"Standing Cable Wood Chop","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"m2":["shoulders"],"f":"twist","o":{"load":"cable"},"ax":1,"nd":["cable"]},{"id":"Standing_Calf_Raises","n":"Standing Calf Raise (Machine)","lv":0,"c":"strength","m":["calves"],"s":"calves","p":3,"a":"Standing Calf Raises","f":"calfRaise","o":{"load":"machine"},"nd":["machine"]},{"id":"Standing_Concentration_Curl","n":"Standing Concentration Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":1,"m2":["forearms"],"f":"curl","o":{"load":"db","pos":"conc"},"ax":1,"nd":["dumbbell"]},{"id":"Standing_Dumbbell_Calf_Raise","n":"Standing Dumbbell Calf Raise","lv":1,"c":"strength","m":["calves"],"s":"calves","p":3,"f":"calfRaise","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Standing_Dumbbell_Press","n":"Standing Dumbbell Press","lv":0,"c":"strength","m":["shoulders"],"s":"vpush","p":2,"m2":["triceps"],"f":"ohPress","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Standing_Dumbbell_Reverse_Curl","n":"Standing Dumbbell Reverse Curl","lv":1,"c":"strength","m":["biceps"],"s":"biceps","p":1,"m2":["forearms"],"f":"curl","o":{"load":"db","pos":"stand"},"nd":["dumbbell"]},{"id":"Standing_Dumbbell_Straight-Arm_Front_Delt_Raise_Above_Head","n":"Standing Dumbbell Straight-Arm Front Delt Raise Above Head","lv":1,"c":"strength","m":["shoulders"],"s":"delts","p":1,"f":"frontRaise","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Standing_Dumbbell_Triceps_Extension","n":"Standing Dumbbell Triceps Extension","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":3,"f":"overTri","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Standing_Dumbbell_Upright_Row","n":"Standing Dumbbell Upright Row","lv":0,"c":"strength","m":["traps"],"s":"delts","p":2,"m2":["biceps","shoulders"],"f":"uprightRow","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Standing_Elevated_Quad_Stretch","n":"Standing Elevated Quad Stretch","lv":0,"c":"stretching","m":["quadriceps"],"s":"stretch","p":2,"f":"stQuad","u":"side"},{"id":"Standing_Front_Barbell_Raise_Over_Head","n":"Standing Front Barbell Raise Over Head","lv":1,"c":"strength","m":["shoulders"],"s":"delts","p":1,"f":"frontRaise","o":{"load":"bb"},"nd":["barbell"]},{"id":"Standing_Gastrocnemius_Calf_Stretch","n":"Standing Gastrocnemius Calf Stretch","lv":0,"c":"stretching","m":["calves"],"s":"stretch","p":1,"m2":["hamstrings"],"f":"calf","ax":1,"u":"side"},{"id":"Standing_Hamstring_and_Calf_Stretch","n":"Standing Hamstring and Calf Stretch","lv":0,"c":"stretching","m":["hamstrings"],"s":"stretch","p":1,"f":"stFold"},{"id":"Standing_Hip_Circles","n":"Standing Hip Circles","lv":0,"c":"stretching","m":["abductors"],"s":"stretch","p":1,"m2":["adductors"],"f":"hipCircles","ax":1},{"id":"Standing_Hip_Flexors","n":"Standing Hip Flexors","lv":0,"c":"stretching","m":["quadriceps"],"s":"stretch","p":2,"f":"stHipFlexor","u":"side"},{"id":"Standing_Inner-Biceps_Curl","n":"Standing Inner-Biceps Curl","lv":1,"c":"strength","m":["biceps"],"s":"biceps","p":1,"f":"curl","o":{"load":"db","pos":"stand"},"nd":["dumbbell"]},{"id":"Standing_Lateral_Stretch","n":"Standing Side Stretch","lv":0,"c":"stretching","m":["abdominals"],"s":"stretch","p":3,"a":"Standing Lateral Stretch","f":"sideBend","o":{"hold":1},"u":"side"},{"id":"Standing_Leg_Curl","n":"Standing Leg Curl","lv":0,"c":"strength","m":["hamstrings"],"s":"hipIso","p":1,"f":"legCurl","o":{"pos":"standing"},"nd":["machine"],"u":"side"},{"id":"Standing_Long_Jump","n":"Standing Long Jump","lv":0,"c":"plyometrics","m":["quadriceps"],"s":"plyo","p":1,"m2":["calves","glutes","hamstrings"],"f":"jump","ax":1},{"id":"Standing_Low-Pulley_Deltoid_Raise","n":"Standing Low-Pulley Deltoid Raise","lv":0,"c":"strength","m":["shoulders"],"s":"delts","p":2,"m2":["forearms"],"f":"lateralRaise","o":{"load":"cable"},"nd":["cable"]},{"id":"Standing_Low-Pulley_One-Arm_Triceps_Extension","n":"Standing Low-Pulley One-Arm Triceps Extension","lv":1,"c":"strength","m":["triceps"],"s":"triceps","p":1,"m2":["chest","shoulders"],"f":"overTri","o":{"load":"cable"},"nd":["cable"],"u":"side"},{"id":"Standing_Military_Press","n":"Standing Military Press","lv":0,"c":"strength","m":["shoulders"],"s":"vpush","p":3,"m2":["triceps"],"f":"ohPress","o":{"load":"bb"},"nd":["barbell"]},{"id":"Standing_Olympic_Plate_Hand_Squeeze","n":"Standing Olympic Plate Hand Squeeze","lv":0,"c":"strength","m":["forearms"],"s":"none","p":1,"m2":["biceps"],"nd":["plate"]},{"id":"Standing_One-Arm_Cable_Curl","n":"Standing One-Arm Cable Curl","lv":1,"c":"strength","m":["biceps"],"s":"biceps","p":1,"f":"curl","o":{"load":"cable","pos":"stand"},"nd":["cable"],"u":"side"},{"id":"Standing_One-Arm_Dumbbell_Curl_Over_Incline_Bench","n":"Standing One-Arm Dumbbell Curl Over Incline Bench","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":1,"f":"curl","o":{"load":"db","pos":"preacher"},"nd":["bench","dumbbell"],"u":"side"},{"id":"Standing_One-Arm_Dumbbell_Triceps_Extension","n":"Standing One-Arm Dumbbell Triceps Extension","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":1,"m2":["chest","shoulders"],"f":"overTri","o":{"load":"db"},"nd":["dumbbell"],"u":"side"},{"id":"Standing_Overhead_Barbell_Triceps_Extension","n":"Standing Overhead Barbell Triceps Extension","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":1,"m2":["shoulders"],"f":"overTri","o":{"load":"bb"},"nd":["barbell"]},{"id":"Standing_Palm-In_One-Arm_Dumbbell_Press","n":"Standing Palm-In One-Arm Dumbbell Press","lv":0,"c":"strength","m":["shoulders"],"s":"vpush","p":1,"m2":["triceps"],"f":"ohPress","o":{"load":"db"},"nd":["dumbbell"],"u":"side"},{"id":"Standing_Palms-In_Dumbbell_Press","n":"Standing Palms-In Dumbbell Press","lv":1,"c":"strength","m":["shoulders"],"s":"vpush","p":1,"m2":["triceps"],"f":"ohPress","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Standing_Palms-Up_Barbell_Behind_The_Back_Wrist_Curl","n":"Standing Palms-Up Barbell Behind The Back Wrist Curl","lv":0,"c":"strength","m":["forearms"],"s":"forearms","p":1,"f":"wristCurl","o":{"load":"bb"},"nd":["barbell"]},{"id":"Standing_Pelvic_Tilt","n":"Standing Pelvic Tilt","lv":0,"c":"stretching","m":["lower back"],"s":"none","p":1,"m2":["glutes"]},{"id":"Standing_Rope_Crunch","n":"Standing Rope Crunch","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"cableCrunch","nd":["cable"]},{"id":"Standing_Soleus_And_Achilles_Stretch","n":"Standing Soleus And Achilles Stretch","lv":0,"c":"stretching","m":["calves"],"s":"stretch","p":1,"f":"calf","ax":1,"u":"side"},{"id":"Standing_Toe_Touches","n":"Standing Forward Fold","lv":0,"c":"stretching","m":["hamstrings"],"s":"stretch","p":3,"a":"Standing Toe Touches","m2":["calves"],"f":"stFold"},{"id":"Standing_Towel_Triceps_Extension","n":"Standing Towel Triceps Extension","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":0,"f":"overTri","nd":["other"]},{"id":"Standing_Two-Arm_Overhead_Throw","n":"Standing Two-Arm Overhead Throw","lv":0,"c":"plyometrics","m":["shoulders"],"s":"plyo","p":1,"m2":["chest","lats"],"f":"ballSlam","ax":1,"nd":["medball"]},{"id":"Star_Jump","n":"Star Jump","lv":0,"c":"plyometrics","m":["quadriceps"],"s":"plyo","p":2,"m2":["calves","glutes","hamstrings","shoulders"],"f":"starJump"},{"id":"Step-up_with_Knee_Raise","n":"Step-up with Knee Raise","lv":0,"c":"strength","m":["glutes"],"s":"knee","p":2,"m2":["hamstrings","quadriceps"],"f":"stepUp","nd":["box"],"u":"side"},{"id":"Step_Mill","n":"Step Mill","lv":1,"c":"cardio","m":["quadriceps"],"s":"cardio","p":1,"m2":["calves","glutes","hamstrings"],"f":"stepUp","nd":["cardio"]},{"id":"Stiff-Legged_Barbell_Deadlift","n":"Stiff-Legged Barbell Deadlift","lv":1,"c":"strength","m":["hamstrings"],"s":"hip","p":2,"m2":["glutes","lower back"],"f":"deadlift","o":{"load":"bb","style":"stiff"},"nd":["barbell"]},{"id":"Stiff-Legged_Dumbbell_Deadlift","n":"Stiff-Legged Dumbbell Deadlift","lv":0,"c":"strength","m":["hamstrings"],"s":"hip","p":3,"m2":["glutes","lower back"],"f":"deadlift","o":{"load":"db","style":"stiff"},"nd":["dumbbell"]},{"id":"Stiff_Leg_Barbell_Good_Morning","n":"Stiff Leg Barbell Good Morning","lv":0,"c":"strength","m":["lower back"],"s":"hip","p":1,"m2":["glutes","hamstrings"],"f":"goodMorning","o":{"load":"bb"},"nd":["barbell"]},{"id":"Stomach_Vacuum","n":"Stomach Vacuum","lv":0,"c":"stretching","m":["abdominals"],"s":"none","p":1},{"id":"Straight-Arm_Dumbbell_Pullover","n":"Straight-Arm Dumbbell Pullover","lv":1,"c":"strength","m":["chest"],"s":"chestIso","p":2,"m2":["lats","shoulders","triceps"],"f":"pullover","o":{"load":"db"},"nd":["bench","dumbbell"]},{"id":"Straight-Arm_Pulldown","n":"Straight-Arm Pulldown","lv":0,"c":"strength","m":["lats"],"s":"vpull","p":2,"f":"armPulldown","o":{"load":"cable"},"nd":["cable"]},{"id":"Straight_Bar_Bench_Mid_Rows","n":"Straight Bar Bench Mid Rows","lv":0,"c":"strength","m":["middle back"],"s":"hpull","p":1,"m2":["biceps","lats"],"f":"bentRow","o":{"load":"bb","bench":1},"ax":1,"nd":["barbell","bench"]},{"id":"Straight_Raises_on_Incline_Bench","n":"Straight Raises on Incline Bench","lv":0,"c":"strength","m":["shoulders"],"s":"none","p":1,"m2":["traps"],"nd":["barbell","bench"]},{"id":"Stride_Jump_Crossover","n":"Stride Jump Crossover","lv":0,"c":"plyometrics","m":["quadriceps"],"s":"plyo","p":0,"m2":["abductors","adductors","calves","hamstrings"],"f":"jump","ax":1,"nd":["other"]},{"id":"Sumo_Deadlift","n":"Sumo Deadlift","lv":1,"c":"powerlifting","m":["hamstrings"],"s":"hip","p":2,"m2":["adductors","forearms","glutes","lower back","middle back","quadriceps","traps"],"f":"deadlift","o":{"load":"bb","style":"conv"},"nd":["barbell"]},{"id":"Sumo_Deadlift_with_Bands","n":"Sumo Deadlift with Bands","lv":1,"c":"powerlifting","m":["hamstrings"],"s":"hip","p":1,"m2":["adductors","forearms","glutes","lower back","middle back","quadriceps","traps"],"f":"deadlift","o":{"load":"bb","style":"conv"},"nd":["bands","barbell"]},{"id":"Sumo_Deadlift_with_Chains","n":"Sumo Deadlift with Chains","lv":1,"c":"powerlifting","m":["hamstrings"],"s":"hip","p":1,"m2":["abductors","adductors","forearms","glutes","lower back","middle back","quadriceps","traps"],"f":"deadlift","o":{"load":"bb","style":"conv"},"nd":["barbell","rack"]},{"id":"Superman","n":"Superman","lv":0,"c":"stretching","m":["lower back"],"s":"hipIso","p":3,"m2":["glutes","hamstrings"],"f":"superman"},{"id":"Supine_Chest_Throw","n":"Supine Chest Throw","lv":0,"c":"plyometrics","m":["triceps"],"s":"plyo","p":1,"m2":["chest","shoulders"],"f":"chestPass","ax":1,"nd":["medball"]},{"id":"Supine_One-Arm_Overhead_Throw","n":"Supine One-Arm Overhead Throw","lv":0,"c":"plyometrics","m":["abdominals"],"s":"plyo","p":1,"m2":["chest","lats","shoulders"],"f":"ballSlam","ax":1,"nd":["medball"],"u":"side"},{"id":"Supine_Two-Arm_Overhead_Throw","n":"Supine Two-Arm Overhead Throw","lv":0,"c":"plyometrics","m":["abdominals"],"s":"plyo","p":1,"m2":["chest","lats","shoulders"],"f":"ballSlam","ax":1,"nd":["medball"]},{"id":"Suspended_Fallout","n":"Suspended Fallout","lv":1,"c":"strength","m":["abdominals"],"s":"core","p":1,"m2":["chest","lower back","shoulders"],"f":"rollout","nd":["trx"]},{"id":"Suspended_Push-Up","n":"Suspended Push-Up","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["shoulders","triceps"],"f":"pushup","o":{"v":"full"},"ax":1,"nd":["trx"]},{"id":"Suspended_Reverse_Crunch","n":"Suspended Reverse Crunch","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"legRaise","ax":1,"nd":["trx"]},{"id":"Suspended_Row","n":"Suspended Row","lv":0,"c":"strength","m":["middle back"],"s":"hpull","p":3,"m2":["biceps","lats"],"f":"invRow","nd":["trx"]},{"id":"Suspended_Split_Squat","n":"Suspended Split Squat","lv":1,"c":"strength","m":["quadriceps"],"s":"knee","p":1,"m2":["abductors","adductors","calves","glutes","hamstrings"],"f":"lunge","o":{"mode":"bulgarian"},"nd":["trx"],"u":"side"},{"id":"Svend_Press","n":"Svend Press","lv":0,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["forearms","shoulders","triceps"],"f":"standPress","ax":1,"nd":["plate"]},{"id":"T-Bar_Row_with_Handle","n":"T-Bar Row with Handle","lv":0,"c":"strength","m":["middle back"],"s":"hpull","p":2,"m2":["biceps","lats"],"f":"bentRow","o":{"load":"bb"},"nd":["barbell"]},{"id":"Tate_Press","n":"Tate Press","lv":1,"c":"strength","m":["triceps"],"s":"triceps","p":1,"m2":["chest","shoulders"],"f":"skull","o":{"load":"db"},"nd":["bench","dumbbell"]},{"id":"The_Straddle","n":"The Straddle","lv":0,"c":"stretching","m":["hamstrings"],"s":"stretch","p":1,"m2":["adductors","calves"],"f":"stButterfly","ax":1},{"id":"Thigh_Abductor","n":"Thigh Abductor","lv":0,"c":"strength","m":["abductors"],"s":"hipIso","p":2,"m2":["glutes"],"f":"thighMachine","o":{"dir":"out"},"nd":["machine"]},{"id":"Thigh_Adductor","n":"Thigh Adductor","lv":0,"c":"strength","m":["adductors"],"s":"hipIso","p":2,"m2":["glutes","hamstrings"],"f":"thighMachine","o":{"dir":"in"},"nd":["machine"]},{"id":"Tire_Flip","n":"Tire Flip","lv":1,"c":"strongman","m":["quadriceps"],"s":"none","p":0,"m2":["calves","chest","forearms","glutes","hamstrings","lower back","shoulders","traps","triceps"],"nd":["other"]},{"id":"Toe_Touchers","n":"Toe Touchers","lv":0,"c":"stretching","m":["abdominals"],"s":"core","p":2,"f":"crunch","o":{"legsUp":1}},{"id":"Torso_Rotation","n":"Torso Rotation","lv":0,"c":"stretching","m":["abdominals"],"s":"core","p":1,"f":"twist","ax":1,"nd":["exball"]},{"id":"Trail_Running_Walking","n":"Trail Running/Walking","lv":0,"c":"cardio","m":["quadriceps"],"s":"cardio","p":0,"m2":["calves","glutes","hamstrings"],"f":"run"},{"id":"Trap_Bar_Deadlift","n":"Trap Bar Deadlift","lv":0,"c":"strength","m":["quadriceps"],"s":"hip","p":0,"m2":["glutes","hamstrings"],"f":"deadlift","o":{"load":"bb","style":"conv"},"nd":["other"]},{"id":"Tricep_Dumbbell_Kickback","n":"Tricep Dumbbell Kickback","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":2,"f":"triKickback","o":{"load":"db"},"nd":["dumbbell"]},{"id":"Tricep_Side_Stretch","n":"Tricep Side Stretch","lv":0,"c":"stretching","m":["triceps"],"s":"stretch","p":1,"m2":["shoulders"],"f":"stTriceps","u":"side"},{"id":"Triceps_Overhead_Extension_with_Rope","n":"Triceps Overhead Extension with Rope","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":1,"f":"overTri","o":{"load":"cable"},"nd":["cable"]},{"id":"Triceps_Pushdown","n":"Triceps Pushdown","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":3,"f":"pushdown","o":{"load":"cable"},"nd":["cable"]},{"id":"Triceps_Pushdown_-_Rope_Attachment","n":"Triceps Pushdown - Rope Attachment","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":3,"f":"pushdown","o":{"load":"cable"},"nd":["cable"]},{"id":"Triceps_Pushdown_-_V-Bar_Attachment","n":"Triceps Pushdown - V-Bar Attachment","lv":0,"c":"strength","m":["triceps"],"s":"triceps","p":1,"f":"pushdown","o":{"load":"cable"},"nd":["cable"]},{"id":"Triceps_Stretch","n":"Triceps Stretch","lv":0,"c":"stretching","m":["triceps"],"s":"stretch","p":3,"m2":["lats"],"f":"stTriceps","u":"side"},{"id":"Tuck_Crunch","n":"Tuck Crunch","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"crunch"},{"id":"Two-Arm_Dumbbell_Preacher_Curl","n":"Two-Arm Dumbbell Preacher Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":1,"f":"curl","o":{"load":"db","pos":"preacher"},"nd":["dumbbell","machine"]},{"id":"Two-Arm_Kettlebell_Clean","n":"Two-Arm Kettlebell Clean","lv":1,"c":"strength","m":["shoulders"],"s":"olympic","p":1,"m2":["calves","glutes","hamstrings","lower back","traps"],"f":"clean","o":{"load":"kb"},"nd":["kettlebell"]},{"id":"Two-Arm_Kettlebell_Jerk","n":"Two-Arm Kettlebell Jerk","lv":1,"c":"strength","m":["shoulders"],"s":"olympic","p":1,"m2":["calves","quadriceps","triceps"],"f":"jerk","o":{"load":"kb"},"nd":["kettlebell"]},{"id":"Two-Arm_Kettlebell_Military_Press","n":"Two-Arm Kettlebell Military Press","lv":1,"c":"strength","m":["shoulders"],"s":"vpush","p":2,"m2":["triceps"],"f":"ohPress","o":{"load":"kb"},"nd":["kettlebell"]},{"id":"Two-Arm_Kettlebell_Row","n":"Two-Arm Kettlebell Row","lv":1,"c":"strength","m":["middle back"],"s":"hpull","p":2,"m2":["biceps","lats"],"f":"bentRow","o":{"load":"kb"},"nd":["kettlebell"]},{"id":"Underhand_Cable_Pulldowns","n":"Underhand Cable Pulldowns","lv":0,"c":"strength","m":["lats"],"s":"vpull","p":2,"m2":["biceps","middle back","shoulders"],"f":"pulldown","nd":["cable"]},{"id":"Upper_Back-Leg_Grab","n":"Upper Back-Leg Grab","lv":0,"c":"stretching","m":["hamstrings"],"s":"stretch","p":1,"m2":["lower back","middle back"],"f":"stFold"},{"id":"Upper_Back_Stretch","n":"Upper Back Stretch","lv":0,"c":"stretching","m":["middle back"],"s":"stretch","p":1,"m2":["middle back"],"f":"stReach","ax":1},{"id":"Upright_Barbell_Row","n":"Upright Barbell Row","lv":0,"c":"strength","m":["shoulders"],"s":"delts","p":2,"m2":["traps"],"f":"uprightRow","o":{"load":"bb"},"nd":["barbell"]},{"id":"Upright_Cable_Row","n":"Upright Cable Row","lv":1,"c":"strength","m":["traps"],"s":"delts","p":1,"m2":["shoulders"],"f":"uprightRow","o":{"load":"cable"},"nd":["cable"]},{"id":"Upright_Row_-_With_Bands","n":"Band Upright Row","lv":0,"c":"strength","m":["traps"],"s":"delts","p":2,"a":"Upright Row - With Bands","m2":["shoulders"],"f":"uprightRow","o":{"load":"band"},"nd":["bands"]},{"id":"Upward_Stretch","n":"Overhead Reach","lv":0,"c":"stretching","m":["shoulders"],"s":"stretch","p":3,"a":"Upward Stretch","m2":["chest","lats"],"f":"stReach"},{"id":"V-Bar_Pulldown","n":"V-Bar Pulldown","lv":1,"c":"strength","m":["lats"],"s":"vpull","p":2,"m2":["biceps","middle back","shoulders"],"f":"pulldown","nd":["cable"]},{"id":"V-Bar_Pullup","n":"V-Bar Pullup","lv":0,"c":"strength","m":["lats"],"s":"vpull","p":1,"m2":["biceps","middle back","shoulders"],"f":"pullUp","nd":["pullupbar"]},{"id":"Vertical_Swing","n":"Vertical Swing","lv":0,"c":"plyometrics","m":["hamstrings"],"s":"plyo","p":1,"m2":["glutes","quadriceps","shoulders"],"f":"jump","ax":1,"nd":["dumbbell"]},{"id":"Walking_Treadmill","n":"Treadmill Walk","lv":0,"c":"cardio","m":["quadriceps"],"s":"cardio","p":2,"a":"Walking, Treadmill","m2":["calves","glutes","hamstrings"],"f":"walk","nd":["cardio"]},{"id":"Weighted_Ball_Hyperextension","n":"Weighted Ball Hyperextension","lv":1,"c":"strength","m":["lower back"],"s":"hipIso","p":1,"m2":["glutes","hamstrings","middle back"],"f":"hyperext","ax":1,"nd":["exball"]},{"id":"Weighted_Ball_Side_Bend","n":"Weighted Ball Side Bend","lv":1,"c":"strength","m":["abdominals"],"s":"core","p":0,"f":"sideBend","ax":1,"nd":["exball"],"u":"side"},{"id":"Weighted_Bench_Dip","n":"Weighted Bench Dip","lv":1,"c":"strength","m":["triceps"],"s":"triceps","p":1,"m2":["chest","shoulders"],"f":"dip","o":{"v":"bench"},"nd":["plate"]},{"id":"Weighted_Crunches","n":"Weighted Crunches","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"crunch","nd":["medball"]},{"id":"Weighted_Jump_Squat","n":"Weighted Jump Squat","lv":1,"c":"strength","m":["quadriceps"],"s":"plyo","p":1,"m2":["calves","glutes","hamstrings","lower back"],"f":"jump","o":{"load":"bb"},"nd":["barbell"]},{"id":"Weighted_Pull_Ups","n":"Weighted Pull Ups","lv":1,"c":"strength","m":["lats"],"s":"vpull","p":1,"m2":["biceps","middle back"],"f":"pullUp","nd":["pullupbar"]},{"id":"Weighted_Sissy_Squat","n":"Weighted Sissy Squat","lv":2,"c":"strength","m":["quadriceps"],"s":"none","p":1,"m2":["calves","glutes","hamstrings"],"nd":["barbell"]},{"id":"Weighted_Sit-Ups_-_With_Bands","n":"Weighted Sit-Ups - With Bands","lv":1,"c":"strength","m":["abdominals"],"s":"core","p":1,"f":"situp","nd":["bands"]},{"id":"Weighted_Squat","n":"Weighted Squat","lv":1,"c":"strength","m":["quadriceps"],"s":"knee","p":0,"m2":["calves","glutes","hamstrings"],"f":"squat","o":{"load":"goblet"},"nd":["plate"]},{"id":"Wide-Grip_Barbell_Bench_Press","n":"Wide-Grip Barbell Bench Press","lv":1,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["shoulders","triceps"],"f":"benchPress","o":{"load":"bb","inc":"flat"},"nd":["barbell","bench"]},{"id":"Wide-Grip_Decline_Barbell_Bench_Press","n":"Wide-Grip Decline Barbell Bench Press","lv":1,"c":"strength","m":["chest"],"s":"hpush","p":1,"m2":["shoulders","triceps"],"f":"benchPress","o":{"load":"bb","inc":"decline"},"nd":["barbell","bench"]},{"id":"Wide-Grip_Decline_Barbell_Pullover","n":"Wide-Grip Decline Barbell Pullover","lv":1,"c":"strength","m":["chest"],"s":"chestIso","p":1,"m2":["shoulders","triceps"],"f":"pullover","o":{"load":"bb"},"nd":["barbell","bench"]},{"id":"Wide-Grip_Lat_Pulldown","n":"Wide-Grip Lat Pulldown","lv":0,"c":"strength","m":["lats"],"s":"vpull","p":3,"m2":["biceps","middle back","shoulders"],"f":"pulldown","nd":["cable"]},{"id":"Wide-Grip_Pulldown_Behind_The_Neck","n":"Wide-Grip Pulldown Behind The Neck","lv":1,"c":"strength","m":["lats"],"s":"vpull","p":0,"m2":["biceps","middle back","shoulders"],"f":"pulldown","nd":["cable"]},{"id":"Wide-Grip_Rear_Pull-Up","n":"Wide-Grip Rear Pull-Up","lv":1,"c":"strength","m":["lats"],"s":"vpull","p":0,"m2":["biceps","middle back","shoulders"],"f":"pullUp","nd":["pullupbar"]},{"id":"Wide-Grip_Standing_Barbell_Curl","n":"Wide-Grip Standing Barbell Curl","lv":0,"c":"strength","m":["biceps"],"s":"biceps","p":1,"f":"curl","o":{"load":"bb","pos":"stand"},"nd":["barbell"]},{"id":"Wide_Stance_Barbell_Squat","n":"Wide Stance Barbell Squat","lv":1,"c":"strength","m":["quadriceps"],"s":"knee","p":1,"m2":["calves","glutes","hamstrings","lower back"],"f":"squat","o":{"load":"bbBack"},"nd":["barbell"]},{"id":"Wide_Stance_Stiff_Legs","n":"Wide Stance Stiff Legs","lv":1,"c":"olympic weightlifting","m":["hamstrings"],"s":"hip","p":0,"m2":["adductors","glutes","lower back"],"f":"deadlift","o":{"load":"bb","style":"stiff"},"nd":["barbell"]},{"id":"Wind_Sprints","n":"Wind Sprints","lv":0,"c":"strength","m":["abdominals"],"s":"core","p":0,"f":"hangRaise","nd":["pullupbar"]},{"id":"Windmills","n":"Windmills","lv":1,"c":"stretching","m":["abductors"],"s":"stretch","p":1,"m2":["glutes","hamstrings","lower back"],"f":"stFold","ax":1},{"id":"Worlds_Greatest_Stretch","n":"World's Greatest Stretch","lv":1,"c":"stretching","m":["hamstrings"],"s":"stretch","p":1,"m2":["calves","glutes","quadriceps"],"f":"stHipFlexor","ax":1,"u":"side"},{"id":"Wrist_Circles","n":"Wrist Circles","lv":0,"c":"stretching","m":["forearms"],"s":"none","p":1},{"id":"Wrist_Roller","n":"Wrist Roller","lv":0,"c":"strength","m":["forearms"],"s":"none","p":0,"m2":["shoulders"],"nd":["other"]},{"id":"Wrist_Rotations_with_Straight_Bar","n":"Wrist Rotations with Straight Bar","lv":0,"c":"strength","m":["forearms"],"s":"forearms","p":0,"f":"wristCurl","o":{"load":"bb"},"nd":["barbell"]},{"id":"Yoke_Walk","n":"Yoke Walk","lv":1,"c":"strongman","m":["quadriceps"],"s":"carry","p":0,"m2":["abdominals","abductors","adductors","calves","glutes","hamstrings","lower back"],"f":"carry","nd":["other"]},{"id":"Zercher_Squats","n":"Zercher Squats","lv":2,"c":"strength","m":["quadriceps"],"s":"knee","p":0,"m2":["calves","glutes","hamstrings"],"f":"squat","o":{"load":"front"},"nd":["barbell"]},{"id":"Zottman_Curl","n":"Zottman Curl","lv":1,"c":"strength","m":["biceps"],"s":"biceps","p":1,"m2":["forearms"],"f":"curl","o":{"load":"db","pos":"stand"},"nd":["dumbbell"]},{"id":"Zottman_Preacher_Curl","n":"Zottman Preacher Curl","lv":1,"c":"strength","m":["biceps"],"s":"biceps","p":1,"m2":["forearms"],"f":"curl","o":{"load":"db","pos":"preacher"},"nd":["dumbbell","machine"]}];
+
+
+/* ===================== What each movement family needs to be coached: cues, pacing, sides =====================
+   Every line of cue text here was written for this app. c(o) returns [set up, move, watch]. */
+const FAM = {
+  squat: { c: o => [
+      (o.chair ? 'Chair behind you, feet about shoulder-width apart.' : o.box ? 'Stand just in front of the box or bench, feet about shoulder-width apart.' : 'Feet about shoulder-width apart, toes turned out slightly.') +
+      ({ bbBack: ' Bar resting across your upper back.', front: ' Bar on the front of your shoulders, elbows high.', goblet: ' Hold the weight close to your chest.', dbSides: ' A weight in each hand at your sides.',
+         oh: ' Weight locked out overhead, arms straight.', band: ' Stand on the band and hold the ends at your shoulders.' }[o.load] || ''),
+      (o.chair || o.box) ? 'Push your hips back, touch the seat lightly, then stand up through your heels.' : 'Push your hips back and bend your knees until your thighs are about level, then stand up through your heels.',
+      'Keep your knees in line with your toes. Don\'t let them cave in.'] },
+  jump: { impact: 1, c: o => ['Feet hip-width apart, arms loose.', o.tuck ? 'Dip quickly, jump straight up and pull your knees toward your chest, then land softly.' : 'Dip quickly, jump straight up, and land softly on bent knees.',
+      'Land quietly with your knees over your toes. Reset before the next jump.'] },
+  boxJump: { impact: 1, c: () => ['Stand a short step away from a sturdy box.', 'Swing your arms, jump up and land softly with both feet fully on the box. Step back down.', 'Pick a height you can land on quietly. Step down, don\'t jump down.'] },
+  lungeJump: { impact: 1, both: 1, c: () => ['Start in a lunge, front knee over the ankle.', 'Jump up and switch legs in the air, landing softly in a lunge on the other side.', 'Keep your chest up and land with control. Slow down if your knees wobble.'] },
+  lunge: { c: o => [
+      o.mode === 'bulgarian' ? 'Rear foot resting on a bench or chair behind you, front foot well forward.' : o.mode === 'walk' ? 'Stand tall with room to walk forward.' : o.mode === 'split' ? 'Take a long step forward and stay there, back heel lifted.' : 'Stand tall, feet hip-width apart.',
+      o.mode === 'bulgarian' || o.mode === 'split' ? 'Lower your back knee toward the floor, then push up through the front heel.' : o.mode === 'walk' ? 'Step forward into a lunge, then bring the back foot through into the next step.'
+        : o.mode === 'reverse' ? 'Step back and lower your back knee toward the floor, then push through the front heel to stand.' : 'Step forward and lower until both knees are bent to about 90 degrees, then push back up.',
+      'Front knee stays in line with your toes. Keep your chest tall.'] },
+  stepUp: { c: () => ['Stand facing a sturdy step or box, one foot on top.', 'Press through the top foot to stand up on the step, then lower back down with control.', 'Don\'t push off the floor foot. Keep the knee in line with your toes.'] },
+  deadlift: { c: o => o.style === 'stiff'
+      ? ['Stand tall holding the weight in front of your thighs, knees soft.', 'Push your hips back and slide the weight down your legs until your hamstrings stretch, then stand up.', 'Back flat, weight close to your legs. Stop before your back starts to round.']
+      : [o.style === 'rack' ? 'Bar set just below knee height. Hinge to it with a flat back and grip it.' : 'Feet hip-width apart, weight close to your shins. Hinge down with a flat back and grip it.',
+         'Push the floor away and stand tall, keeping the weight close to your legs. Lower it the same way.', 'Your back stays flat from start to finish. Don\'t round it or jerk the weight.'] },
+  goodMorning: { c: o => [o.load === 'band' ? 'Stand on the band with the other end looped behind your neck, knees soft.' : 'Bar across your upper back, knees soft.', 'Push your hips back and tip your chest forward with a flat back, then stand tall.', 'Start light. Stop the hinge before your back rounds.'] },
+  pullThrough: { c: () => ['Face away from a low cable or band, holding it between your legs. Step forward to take up the slack.', 'Push your hips back, then drive them forward to stand tall.', 'The movement comes from your hips, not your arms. Back flat.'] },
+  swing: { c: () => ['Feet a little wider than your hips, weight on the floor just in front of you.', 'Hike it back between your legs, then snap your hips forward so it floats up to chest height.', 'It is a hip hinge, not a squat or an arm lift. Back flat, arms loose.'] },
+  nordic: { c: () => ['Kneel on a pad with your ankles held down, body straight from knees to head.', 'Lower yourself forward as slowly as you can, catch yourself with your hands, then push back up.', 'Keep your hips straight. This is hard on the hamstrings, so start with a short range.'] },
+  calfRaise: { c: o => [o.seated ? 'Sit with the weight resting on your knees, balls of your feet on the floor or a block.' : 'Stand tall, balls of your feet on the floor or the edge of a step. Hold on to something for balance.', 'Rise onto your toes as high as you can, pause, then lower slowly.', 'All the way up and all the way down. No bouncing.'] },
+  curl: { c: o => [{ seat: 'Sit tall, arms hanging by your sides.', incline: 'Lie back on an incline bench, arms hanging straight down.', preacher: 'Upper arms resting on the pad, arms almost straight.',
+      conc: 'Sit and lean forward, elbow braced against the inside of your thigh.' }[o.pos] || (o.load === 'band' ? 'Stand on the band, arms long, elbows by your sides.' : 'Stand tall, arms long, elbows by your sides.'),
+      'Bend your elbows to bring the weight up toward your shoulders, then lower slowly.', 'Elbows stay put. Don\'t swing your body to lift the weight.'] },
+  frontRaise: { c: () => ['Stand tall, weight in front of your thighs.', 'Raise your arms straight in front to shoulder height, then lower slowly.', 'Don\'t lean back or swing. Use a light weight.'] },
+  pushdown: { c: o => [o.load === 'band' ? 'Anchor the band high (top of a door). Elbows tucked at your sides, hands at chest height.' : 'Face a high cable, elbows tucked at your sides, hands at chest height.', 'Push down until your arms are straight, then let your hands come back up slowly.', 'Only your forearms move. Keep your elbows pinned to your sides.'] },
+  overTri: { c: () => ['Hold the weight overhead, arms straight, elbows close to your ears.', 'Bend your elbows to lower the weight behind your head, then straighten your arms.', 'Upper arms stay still and pointing up. Keep your ribs down.'] },
+  triKickback: { c: () => ['Hinge forward with a flat back, upper arm tight against your side, elbow bent.', 'Straighten your arm behind you, pause, then bend it again.', 'The upper arm stays still and level with your back.'] },
+  bentRow: { c: o => [o.one ? 'One hand and knee on a bench (or one hand on a chair), back flat, weight hanging below your shoulder.' : o.bench ? 'Lie chest-down on an incline bench, weights hanging below your shoulders.'
+      : o.load === 'band' ? 'Stand on the band and hinge forward about 45 degrees with a flat back, arms long.' : 'Hinge forward about 45 degrees with a flat back, weight hanging below your shoulders.',
+      'Pull your elbows back and up, squeeze your shoulder blades together, then lower slowly.', 'Your back stays flat and still. Don\'t jerk the weight up.'] },
+  row: { c: o => [o.load === 'cable' ? 'Set the cable at chest height and step back until your arms are long.' : 'Anchor the band at chest height and step back until it is lightly stretched with your arms long.', 'Pull your elbows straight back and squeeze your shoulder blades together.', 'Shoulders stay down, away from your ears. No shrugging.'] },
+  facePull: { c: () => ['Cable or band set at face height. Step back with your arms long.', 'Pull toward your face, elbows high and wide, until your hands are beside your ears.', 'Squeeze your shoulder blades. Don\'t lean back.'] },
+  armPulldown: { c: () => ['Face a high cable, arms straight out in front, a slight hinge at the hips.', 'Keeping your arms straight, sweep the bar down to your thighs, then return slowly.', 'Arms stay straight. Feel it in the muscles under your armpits, not your triceps.'] },
+  standPress: { c: () => ['Band or cable anchored behind you at chest height. Stagger your feet, hands by your chest.', 'Press straight forward until your arms are long, then return slowly.', 'Stay tall and don\'t let it pull you backward.'] },
+  chestPass: { impact: 1, c: () => ['Stand facing a solid wall or a partner, ball at your chest.', 'Push the ball away fast from your chest, then catch it and reset.', 'Brace your middle. Use a ball you can throw crisply.'] },
+  ballSlam: { c: () => ['Stand tall with the ball overhead.', 'Throw the ball down hard just in front of your feet, hinging at the hips, then pick it up.', 'Use a ball that doesn\'t bounce much. Bend your knees to pick it up.'] },
+  clean: { c: o => ['Feet hip-width apart, weight close to your shins, back flat.', o.jerk ? 'Stand up fast and catch the weight at your shoulders, then dip and drive it overhead.' : 'Stand up fast, shrug, and pull yourself under to catch the weight at your shoulders.', 'This lift is technical. Start very light and get coaching if you can.'] },
+  snatch: { c: () => ['Feet hip-width apart, wide grip, back flat.', 'Stand up fast and pull yourself under to catch the weight overhead with straight arms.', 'This lift is technical. Start very light and get coaching if you can.'] },
+  jerk: { c: () => ['Weight at your shoulders, feet hip-width apart.', 'Dip a little, drive up hard, and punch the weight overhead.', 'This lift is technical. Start very light and get coaching if you can.'] },
+  highPull: { c: () => ['Feet hip-width apart, weight close to your shins, back flat.', 'Stand up fast, shrug, and pull your elbows high so the weight rises to your chest.', 'The power comes from your legs and hips. Keep the weight close.'] },
+  walk: { verb: 'Walk', c: () => ['Stand tall, shoulders relaxed.', 'Walk briskly, in place or on the machine, and swing your arms.', 'Aim for a pace where you can still talk.'] },
+  run: { verb: 'Run', impact: 1, c: () => ['Stand tall, arms bent.', 'Jog with quick, light steps, in place or on the machine.', 'Land softly. Ease off if you can\'t keep your form.'] },
+  carry: { verb: 'Carry', c: () => ['Pick up a weight in each hand and stand tall.', 'Walk with short, steady steps, weights at your sides.', 'Shoulders back. Don\'t lean to one side.'] },
+  jumpRope: { verb: 'Skip', impact: 1, c: () => ['Rope behind your heels, elbows by your sides.', 'Turn the rope with your wrists and hop just high enough to clear it.', 'Stay on the balls of your feet with soft knees.'] },
+  legSwing: { warm: 1, c: o => ['Stand side-on to a wall or chair and hold it for balance.', o.dir === 'back' ? 'Lift the outside leg straight behind you, squeeze your glutes, then lower.' : 'Lift the outside leg straight forward, then lower it with control.', 'Stand tall. Don\'t arch your back or twist your hips.'] },
+  legSwingF: { warm: 1, c: () => ['Hold a wall or chair with one hand and stand tall.', 'Lift the outside leg out to the side, then lower it with control.', 'Toes point forward and your body stays upright.'] },
+
+  ohPress: { c: o => [o.load === 'band' ? 'Stand on the band, hands at shoulder height, elbows under your wrists.' : (o.seat ? 'Sit tall. ' : '') + 'Hands at shoulder height, elbows under your wrists.', 'Press straight up until your arms are long, then lower with control.', 'Stay tall. Don\'t lean back or shrug your shoulders.'] },
+  lateralRaise: { c: () => ['Stand tall, arms at your sides, a slight bend in your elbows.', 'Raise your arms out to the sides to shoulder height, then lower slowly.', 'Lead with your elbows. No shrugging or swinging.'] },
+  uprightRow: { c: () => ['Stand tall, weight in front of your thighs, hands closer than shoulder-width.', 'Pull your elbows up and out until your hands reach chest height, then lower.', 'Stop at chest height. Skip this one if it pinches your shoulders.'] },
+  shrug: { c: () => ['Stand tall, arms long, weight at your sides or in front.', 'Lift your shoulders straight up toward your ears, pause, then lower.', 'Straight up and down. Don\'t roll your shoulders.'] },
+  reverseFly: { c: o => [o.seat ? 'Sit facing the pad, arms straight out in front on the handles.' : 'Hinge forward with a flat back, arms hanging below your chest, elbows slightly bent.', 'Open your arms out to the sides until they are level with your shoulders, then lower slowly.', 'Squeeze your shoulder blades. Keep the weight light and your neck relaxed.'] },
+  pullApart: { c: () => ['Hold a band in front of your chest, arms straight, hands shoulder-width apart.', 'Pull the band apart until it touches your chest, then return slowly.', 'Shoulders down. Squeeze your shoulder blades together.'] },
+  fly: { c: o => o.pos === 'lying' ? ['Lie on the bench, weights above your chest, elbows slightly bent.', 'Open your arms wide until you feel a stretch across your chest, then bring them back together.', 'Keep the same soft bend in your elbows the whole time.']
+      : o.pos === 'seat' ? ['Sit tall with your back against the pad, arms out wide on the handles.', 'Bring the handles together in front of your chest, then open slowly.', 'Keep a soft bend in your elbows and your shoulders down.']
+      : ['Stand between the cables or bands, arms out wide, one foot forward.', 'Bring your hands together in front of you in a wide arc, then open slowly.', 'Keep a soft bend in your elbows. Don\'t let your shoulders roll forward.'] },
+  pullUp: { verb: 'Hang', c: o => o.hang ? ['Grip the bar and let your body hang.', 'Hang with long arms and relaxed shoulders. Breathe.', 'Come down if your grip starts to slip.']
+      : ['Hang from the bar, hands a little wider than your shoulders.', 'Pull your chest up to the bar, then lower all the way down with control.', 'Lead with your chest and keep your shoulders away from your ears.'] },
+  pulldown: { c: () => ['Sit with your thighs under the pads, hands wide on the bar.', 'Pull the bar down to your upper chest, then let it rise slowly.', 'Lean back only slightly. Don\'t yank with your body.'] },
+  sideBend: { verb: 'Hold', c: o => o.hold ? ['Stand tall and reach one arm overhead.', 'Lean gently to the side until you feel a stretch down your side, and hold.', 'Don\'t lean forward or back.']
+      : ['Stand tall with a weight in one hand at your side.', 'Bend sideways toward the weight, then pull yourself back up tall.', 'Bend straight to the side, not forward.'] },
+  twist: { both: 1, c: () => ['Sit on the floor, knees bent, and lean back slightly with a tall chest.', 'Rotate your shoulders to one side, back to the centre, then to the other side.', 'Turn from your ribs, not just your arms. Keep your back long.'] },
+  starJump: { impact: 1, c: () => ['Stand tall, arms at your sides.', 'Jump your feet apart as your arms go overhead, then jump back together.', 'Land softly on the balls of your feet.'] },
+  lateralHop: { impact: 1, both: 1, c: () => ['Stand on soft knees, feet together.', 'Hop sideways, land softly, then hop straight back.', 'Stay low and land quietly, knees over your toes.'] },
+  rotation: { c: o => ['Elbow bent to 90 degrees and pinned to your side.', o.inward ? 'Rotate your forearm in across your stomach, then return slowly.' : 'Rotate your forearm outward, away from your body, then return slowly.', 'Keep the elbow glued to your side. Use very light resistance.'] },
+  highCurl: { c: () => ['Stand between two high cables, arms out to the sides at shoulder height.', 'Curl your hands in toward your head, then straighten your arms slowly.', 'Upper arms stay level with your shoulders.'] },
+  thighMachine: { c: o => ['Sit tall with the pads against your knees.', o.dir === 'in' ? 'Squeeze your knees together, then let them open slowly.' : 'Push your knees apart, then let them come back slowly.', 'Move smoothly. Don\'t let the weights slam.'] },
+  armCircles: { verb: 'Circle', warm: 1, c: () => ['Stand tall, arms straight out to the sides.', 'Draw circles with your arms. Start small and let them grow.', 'Keep your shoulders down, away from your ears.'] },
+  hipCircles: { verb: 'Circle', warm: 1, c: () => ['Hands on your hips, feet shoulder-width apart.', 'Draw slow, wide circles with your hips.', 'Keep your head roughly still over your feet.'] },
+  stTriceps: { c: () => ['Reach one arm overhead and bend the elbow so the hand drops behind your head.', 'Use the other hand to ease the elbow back gently, and hold.', 'Keep your ribs down and breathe.'] },
+  stCrossArm: { c: () => ['Bring one arm straight across your chest.', 'Use the other arm to hug it closer, and hold.', 'Keep the shoulder down, away from your ear.'] },
+  stReach: { c: () => ['Stand or sit tall and interlace your fingers.', 'Reach your arms up overhead, palms to the ceiling, and hold.', 'Lengthen through your sides. Keep breathing.'] },
+  stNeck: { c: o => o.fwd ? ['Sit or stand tall.', 'Let your chin drop toward your chest and hold.', 'Gentle only. Never force your neck.'] : ['Sit or stand tall, shoulders relaxed.', 'Tip your ear toward your shoulder. The hand adds only light pressure.', 'Gentle only. Never force your neck.'] },
+  stChest: { verb: o => (o.dyn ? 'Swing' : 'Hold'), warm: o => !!o.dyn, c: o => o.dyn ? ['Stand tall, arms straight out in front.', 'Swing your arms open wide, then close them again, in an easy rhythm.', 'Keep it smooth. Don\'t force the end of the range.']
+      : ['Stand tall and clasp your hands behind you, or hold a doorframe.', 'Open your chest and draw your arms back until you feel a stretch, and hold.', 'Keep your ribs down and your chin level.'] },
+  stButterfly: { c: () => ['Sit tall, soles of your feet together, knees out to the sides.', 'Hold your feet and let your knees sink toward the floor. Hold.', 'Lengthen your back. Don\'t force your knees down.'] },
+  stSideLunge: { c: () => ['Stand with your feet wide apart.', 'Bend one knee and sink to that side, keeping the other leg straight. Hold.', 'Both feet stay flat. Feel it in the inner thigh of the straight leg.'] },
+
+  bridge: { c: o => [o.bench ? 'Upper back against a bench, feet flat, weight across your hips.' : (o.single ? 'Lie on your back, one knee bent with the foot flat, the other leg lifted.' : 'Lie on your back, knees bent, feet flat and hip-width apart.') + (o.band ? ' Band just above your knees.' : o.load ? ' Weight across your hips.' : ''),
+      'Squeeze your glutes and lift your hips until shoulders, hips and knees line up.', 'Push through your heels and keep your ribs down. Don\'t arch your lower back.'] },
+  benchPress: { c: o => [o.inc === 'floor' ? 'Lie on the floor, knees bent, weight above your chest.' : 'Lie on the bench, feet flat on the floor, weight above your chest, arms straight.', 'Lower the weight to your chest with control, then press it back up.', 'Wrists over elbows. Keep your shoulder blades pulled back and down.'] },
+  skull: { c: () => ['Lie on the bench, weight above your shoulders, arms straight.', 'Bend only your elbows to lower the weight toward your forehead, then straighten your arms.', 'Upper arms stay still. Use a weight you fully control.'] },
+  pullover: { c: () => ['Lie on the bench holding the weight above your chest, elbows slightly bent.', 'Lower the weight in an arc behind your head, then pull it back over your chest.', 'Keep your ribs down. Stop where your shoulders feel comfortable.'] },
+  crunch: { c: o => [o.ball ? 'Lie back over the ball, feet flat and wide, hands by your temples.' : o.legsUp ? 'Lie on your back, legs straight up, arms reaching toward your toes.' : 'Lie on your back, knees bent, feet flat, hands by your temples.', 'Curl your shoulders off the floor, pause, then lower slowly.', 'Don\'t pull on your neck. Your lower back stays down.'] },
+  situp: { c: () => ['Lie on your back, knees bent, feet flat.', 'Curl up until your chest reaches your thighs, then lower with control.', 'Don\'t yank your neck. Go slower rather than using momentum.'] },
+  vup: { c: () => ['Lie on your back, arms overhead, legs straight.', 'Lift your legs and upper body together and reach for your feet, then lower.', 'Move with control. Bend your knees to make it easier.'] },
+  legRaise: { c: o => o.flutter ? ['Lie on your back, hands under your hips, legs straight and just off the floor.', 'Kick your legs up and down in small, quick, alternating beats.', 'Keep your lower back pressed into the floor.']
+      : ['Lie on your back, legs straight, hands by your sides or under your hips.', 'Raise your legs until they point at the ceiling, then lower them slowly.', 'Don\'t let your lower back arch. Bend your knees to make it easier.'] },
+  airBike: { both: 1, c: () => ['Lie on your back, hands by your temples, knees lifted.', 'Bring one elbow toward the opposite knee while the other leg extends, then switch.', 'Slow and controlled. Don\'t pull on your neck.'] },
+  deadbug: { both: 1, c: () => ['Lie on your back, arms straight up, knees bent above your hips.', 'Lower one arm and the opposite leg toward the floor, come back, then switch sides.', 'Keep your lower back pressed into the mat the whole time.'] },
+  pushup: { c: o => [{ wall: 'Hands on the wall at chest height, feet a big step back.', incline: 'Hands on the edge of a sturdy table, bench or counter, feet back, body straight.', knee: 'Knees on a pad, hands on the floor under your shoulders.',
+      decline: 'Feet up on a bench or step, hands on the floor under your shoulders.' }[o.v] || 'Hands under your shoulders, legs straight, body in one line.', 'Lower your chest toward your hands, then push away.', 'Keep one straight line from head to heels (or knees). Don\'t let your back sag.'] },
+  plank: { c: o => [o.v === 'knee' ? 'Forearms on the floor, elbows under your shoulders, knees on a pad.' : 'Forearms on the floor, elbows under your shoulders, legs straight.', 'Hold one straight line from head to heels (or knees) and keep breathing.', 'Don\'t let your hips sag or lift up.'] },
+  sidePlank: { c: () => ['Lie on your side, elbow under your shoulder, feet stacked.', 'Lift your hips so your body makes one straight line, and hold.', 'Hips stay high and stacked. Don\'t roll forward.'] },
+  mountainClimber: { verb: 'Go', c: () => ['Start at the top of a push-up, hands under your shoulders.', 'Drive one knee toward your chest, then switch legs quickly.', 'Hips stay level with your shoulders. Step instead of hopping to make it gentler.'] },
+  rollout: { c: () => ['Kneel on a pad holding the wheel or bar under your shoulders.', 'Roll forward as far as you can control, then pull back with your abs.', 'Don\'t let your lower back sag. Shorten the range if it does.'] },
+  superman: { c: () => ['Lie face down, arms stretched out in front.', 'Lift your arms, chest and legs a little off the floor, pause, then lower.', 'Look at the floor to keep your neck long. A small lift, no jerking.'] },
+  hyperext: { c: () => ['Hips on the pad, ankles locked in, arms crossed over your chest.', 'Lower your upper body, then raise it until your body makes a straight line.', 'Stop at straight. Don\'t swing or over-arch.'] },
+  dip: { c: o => o.v === 'bars' ? ['Support yourself on the bars with straight arms.', 'Bend your elbows to lower your body, then push back up.', 'Shoulders stay down. Don\'t drop lower than is comfortable.']
+      : ['Hands on the edge of a bench or sturdy chair behind you, feet out in front.', 'Bend your elbows to lower your hips toward the floor, then push back up.', 'Keep your back close to the bench and your shoulders down.'] },
+  invRow: { c: () => ['Hang under a bar or straps set at waist height, body straight, heels on the floor.', 'Pull your chest up to the bar, then lower with control.', 'Keep your hips up: one straight line from head to heels.'] },
+  kickback: { c: o => o.pos === 'stand' ? ['Face the cable and hold the frame, strap around one ankle.', 'Sweep the leg straight back, squeeze your glute, then return slowly.', 'Don\'t arch your lower back or twist your hips.']
+      : ['On hands and knees, back flat.', 'Lift one leg behind you, knee bent, until the thigh is level with your back, then lower.', 'Don\'t arch your lower back or twist your hips.'] },
+  legExt: { c: () => ['Sit back in the seat, pad on your shins just above the ankles.', 'Straighten your legs, pause, then lower slowly.', 'Don\'t kick. Hold the handles and keep your hips down.'] },
+  legCurl: { c: o => [{ seated: 'Sit back in the seat, pad behind your ankles.', standing: 'Stand tall holding the support, pad behind one ankle.', ball: 'Lie on your back, heels on the ball, hips lifted.' }[o.pos] || 'Lie face down, pad just above your heels.', 'Bend your knees to bring your heels toward your hips, then return slowly.', 'Hips stay still. Don\'t let the weight snap back.'] },
+  legPress: { c: () => ['Sit back in the seat, feet shoulder-width apart on the platform.', 'Bend your knees to lower the platform, then press it away without locking your knees.', 'Lower back stays on the pad. Knees track over your toes.'] },
+  seatedRow: { c: () => ['Sit tall, knees soft, arms long holding the handle.', 'Pull the handle to your stomach, elbows brushing your sides, then return slowly.', 'Don\'t rock back and forth. Chest stays tall.'] },
+  chestPressSeated: { c: () => ['Sit back against the pad, handles level with your chest.', 'Press the handles forward until your arms are long, then return slowly.', 'Shoulder blades stay against the pad. Don\'t lock your elbows hard.'] },
+  wristCurl: { c: () => ['Sit with your forearms resting on your thighs or a bench, wrists just past the edge.', 'Curl your wrists up, then lower them slowly.', 'Only your hands move. Use a light weight.'] },
+  cableCrunch: { c: () => ['Kneel below a high cable, holding the rope beside your head.', 'Curl your ribs down toward your hips, then return slowly.', 'Hips stay still. Your abs do the work, not your arms.'] },
+  hangRaise: { c: () => ['Hang from a bar, or support yourself on parallel bars.', 'Raise your knees or straight legs up in front of you, then lower slowly.', 'No swinging. Bend your knees to make it easier.'] },
+  bike: { verb: 'Ride', c: () => ['Set the saddle so your knee stays slightly bent at the bottom.', 'Pedal at a steady pace you could hold a conversation at.', 'Shoulders relaxed, light grip.'] },
+  rower: { verb: 'Row', c: () => ['Strap your feet in, shins upright, arms long.', 'Push with your legs, lean back slightly, then pull the handle to your ribs. Return in reverse.', 'Legs, then body, then arms. Keep your back long.'] },
+
+  stFold: { c: () => ['Stand with your feet hip-width apart, knees soft.', 'Fold forward from your hips and let your arms hang toward the floor. Hold.', 'Don\'t bounce. Bend your knees if your back pulls.'] },
+  stSeatReach: { c: o => [o.chair ? 'Sit on the edge of a chair, one leg straight out, heel on the floor.' : 'Sit on the floor with your legs straight out in front.', 'Reach toward your toes with a long back until you feel the stretch, and hold.', 'Hinge from the hips. Don\'t round and yank.'] },
+  stLegUp: { c: () => ['Lie on your back, one leg straight on the floor.', 'Raise the other leg, hold behind the thigh and ease it toward you. Hold.', 'Keep the raised knee nearly straight and your hips on the floor.'] },
+  stQuad: { c: () => ['Stand next to a wall for balance.', 'Bend one knee, hold the ankle behind you and draw the heel toward your hip. Hold.', 'Knees stay together. Stand tall and don\'t arch your back.'] },
+  stHipFlexor: { c: () => ['Kneel on one knee (use a pad), other foot flat in front.', 'Shift your hips forward until you feel a stretch at the front of the back hip. Hold.', 'Stay tall and squeeze the glute of the back leg.'] },
+  stKneeChest: { c: o => o.both ? ['Lie on your back.', 'Hug both knees to your chest and hold.', 'Keep your head and shoulders relaxed on the floor.'] : ['Lie on your back, legs straight.', 'Pull one knee toward your chest with both hands and hold.', 'Keep your head and shoulders relaxed on the floor.'] },
+  stTwistLying: { c: () => ['Lie on your back, arms out to the sides.', 'Bring one knee across your body toward the floor and hold.', 'Both shoulders stay on the floor.'] },
+  stSeatTwist: { c: () => ['Sit tall on the floor, one leg crossed over the other.', 'Turn your chest toward the raised knee, using your arm against it, and hold.', 'Grow tall first, then turn. Don\'t force it.'] },
+  stChild: { c: () => ['Kneel and sit back on your heels.', 'Fold forward, reach your arms out along the floor and rest your forehead down. Hold.', 'Breathe slowly into your back.'] },
+  stCat: { verb: 'Move', warm: 1, c: () => ['On hands and knees, hands under shoulders, knees under hips.', 'Round your back up to the ceiling, then let it sink and lift your chest. Move slowly.', 'Move with your breath. No forcing.'] },
+  stSeatFold: { c: () => ['Sit on a chair, feet flat and apart.', 'Fold forward between your knees and let your arms and head hang. Hold.', 'Come back up slowly.'] },
+  smr: { verb: 'Roll', c: () => ['Place the roller under the muscle and support your weight with your hands.', 'Roll slowly along the muscle. Pause on tender spots and breathe.', 'Stay on muscle, not on joints or your lower spine. Mild discomfort only.'] },
+  calf: { c: () => ['Hands on the wall, one leg back, heel on the floor, back knee straight.', 'Lean in until you feel the calf stretch. Hold.', 'No bouncing. Both feet point straight ahead.'] },
+  plantar: { c: () => ['Heel on the floor, toes up against the wall.', 'Ease your knee toward the wall until you feel the stretch under your foot. Hold.', 'Or sit, cross the foot over your knee and pull your toes back toward your shin.'] },
+  ball: { verb: 'Roll', c: () => ['Sit down, or hold on to something for balance.', 'Roll the ball slowly under your foot, from heel to toes, with gentle pressure.', 'Slow rolls. Ease off if it is painful.'] }
+};
+
+/* ---- lookups shared by the builder, the player and the screens ---- */
+const EQUIP = [                                                  // what the set-up screen offers, in this order
+  ['bands', 'Resistance bands'], ['dumbbell', 'Dumbbells'], ['kettlebell', 'Kettlebell'], ['barbell', 'Barbell and plates'], ['bench', 'Bench'],
+  ['rack', 'Squat rack'], ['pullupbar', 'Pull-up bar'], ['dipbars', 'Dip bars'], ['cable', 'Cable machine'], ['machine', 'Gym machines'],
+  ['cardio', 'Cardio machine'], ['box', 'Step or sturdy box'], ['rope', 'Jump rope'], ['exball', 'Exercise ball'], ['medball', 'Medicine ball'],
+  ['trx', 'Suspension straps'], ['foamroll', 'Foam roller'], ['mball', 'Massage ball']
+];
+const EQUIP_NAME = { plate: 'Weight plate', other: 'Special equipment', sled: 'Sled' };
+EQUIP.forEach(e => { EQUIP_NAME[e[0]] = e[1]; });
+const WEIGHTED = { barbell: 1, dumbbell: 1, kettlebell: 1, cable: 1, machine: 1, medball: 1, plate: 1 };
+const MUSCLE_AREA = { quadriceps: 'Legs', hamstrings: 'Legs', glutes: 'Legs', calves: 'Legs', adductors: 'Legs', abductors: 'Legs', chest: 'Chest', lats: 'Back', 'middle back': 'Back',
+  'lower back': 'Back', traps: 'Back', shoulders: 'Shoulders', biceps: 'Arms', triceps: 'Arms', forearms: 'Arms', abdominals: 'Core', neck: 'Neck' };
+const LEVEL_NAME = ['Beginner', 'Intermediate', 'Advanced'];
+
+const EX = {};                                                   // id -> catalogue entry
+CATALOGUE.forEach(x => { EX[x.id] = x; });
+const famOf = x => (x.f === 'legSwing' && x.o && x.o.dir === 'side' ? 'legSwingF' : x.f);
+// the drawing for an exercise: [family, options]; extra options (a band on the chair squat, a mirror for the other side) can be laid on top
+function animOf(x, extra) { return [famOf(x), Object.assign({}, x.o || {}, extra || {})]; }
+const famMeta = x => FAM[famOf(x)] || {};
+const optsOf = (x, extra) => Object.assign({}, x.o || {}, extra || {});
+function cuesOf(x, extra) { const m = famMeta(x); return m.c ? m.c(optsOf(x, extra)) : ['', '', '']; }
+// timed (a hold, a stretch, steady cardio) rather than counted in reps
+function isTimed(x, extra) {
+  const D = ANIMS[famOf(x)], o = optsOf(x, extra);
+  if (!D) return false;
+  return !!(D.loop || (typeof D.hold === 'function' ? D.hold(o) : D.hold) || (D.holdable && o.hold));
+}
+function verbOf(x, extra) { const v = famMeta(x).verb; return (typeof v === 'function' ? v(optsOf(x, extra)) : v) || 'Hold'; }
+const isImpact = x => !!famMeta(x).impact;
+function isWarm(x) { const w = famMeta(x).warm; return !!(typeof w === 'function' ? w(x.o || {}) : w); }
+const isWeighted = x => (x.nd || []).some(t => WEIGHTED[t]);
+const perSide = x => x.u === 'side';                              // done once on each side
+const bothInRep = x => !!famMeta(x).both;                         // one counted rep already covers both sides
+const equipText = x => ((x.nd || []).length ? x.nd.map(t => EQUIP_NAME[t] || t).join(', ') : 'No equipment');
+
+/* One rep as a list of phases. tempo = [seconds lowering, seconds lifting]; hold = optional pause at the top. */
+function timelineOf(x, tempo, hold, extra) {
+  const D = ANIMS[famOf(x)], o = optsOf(x, extra);
+  if (!D || isTimed(x, extra)) return null;
+  const T = D.tempo || tempo || [2, 1], Dn = T[0], Up = T[1];
+  if (D.tl) return D.tl(Dn, Up, o);
+  const first = typeof D.first === 'function' ? D.first(o) : D.first, L = typeof D.L === 'function' ? D.L(o) : D.L;
+  const pause = hold ? [{ l: 'Hold', k: 'hold', d: hold, a: 1, b: 1, side: 0 }] : [];
+  if (first === 'down') return [{ l: L[0], k: 'down', d: Dn, a: 0, b: 1, side: 0 }, { l: L[1], k: 'up', d: Up, a: 1, b: 0, side: 0 }];
+  return [{ l: L[0], k: 'up', d: Up, a: 0, b: 1, side: 0 }].concat(pause, [{ l: L[1], k: 'down', d: Dn, a: 1, b: 0, side: 0 }]);
+}
+const cycleOf = tl => tl.reduce((s, p) => s + p.d, 0);
+const loopOf = (x, extra) => { const D = ANIMS[famOf(x)], l = D && (typeof D.loop === 'function' ? D.loop(optsOf(x, extra)) : D.loop); return l || 3; };
+
+
+
+/* ===================== Turning a workout into timed steps, and history into today's targets ===================== */
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const fmtRange = r => (r[0] === r[1] ? '' + r[0] : r[0] + '–' + r[1]);
+const fmtDur = s => (s >= 60 ? (s % 60 ? Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0') + ' min' : (s / 60) + ' min') : s + ' sec');
+const spokenDur = s => (s >= 60 && s % 60 === 0 ? (s / 60) + (s === 60 ? ' minute' : ' minutes') : s >= 60 ? Math.floor(s / 60) + ' minute' + (s >= 120 ? 's ' : ' ') + (s % 60) + ' seconds' : s + ' seconds');
+
+const itemTimed = it => !!it.secs || isTimed(EX[it.x], it.o);
+// "3 × 8–12", "3 × 20–45 sec", "2 min", "10 reps", with "each side" where it applies
+function rxText(it) {
+  const x = EX[it.x], timed = itemTimed(it), rg = timed ? (it.secs || [30, 30]) : it.reps, n = it.sets || 1;
+  const side = perSide(x) ? ' each side' : (!timed && bothInRep(x)) ? ' per side' : it.rev ? ' each way' : '';
+  if (timed) return (n > 1 ? n + ' × ' : '') + (rg[0] === rg[1] ? fmtDur(rg[0]) : fmtRange(rg) + ' sec') + side;
+  return (n > 1 ? n + ' × ' + fmtRange(rg) : fmtRange(rg) + ' reps') + side;
+}
+
+/* ---------- history -> what to aim for today ---------- */
+// most recent finished session that has at least one done set of this exercise
+function lastOf(log, exId) {
+  for (let i = log.length - 1; i >= 0; i--) {
+    const e = (log[i].ex || []).find(q => q.x === exId);
+    if (e && e.sets.some(s => s.d)) return { t: log[i].t, sets: e.sets.filter(s => s.d) };
+  }
+  return null;
+}
+function targetOf(it, last) {
+  const timed = itemTimed(it), rg = timed ? (it.secs || [30, 30]) : it.reps, step = timed ? 5 : 1;
+  if (rg[0] === rg[1] || !last) return rg[0];
+  const vals = last.sets.map(s => (timed ? s.s : s.r)).filter(v => typeof v === 'number');
+  if (!vals.length) return rg[0];
+  const mn = Math.min.apply(null, vals);
+  if (mn >= rg[1]) return (!timed && isWeighted(EX[it.x])) ? rg[0] : rg[1];      // top of the range on every set: go heavier and start again from the low end
+  return clamp(Math.round((mn + step) / step) * step, rg[0], rg[1]);
+}
+// true when last time every set reached the top of the range
+function readyToProgress(it, last) {
+  const timed = itemTimed(it), rg = timed ? (it.secs || [30, 30]) : it.reps;
+  if (!last || rg[0] === rg[1]) return false;
+  const vals = last.sets.map(s => (timed ? s.s : s.r)).filter(v => typeof v === 'number');
+  return vals.length >= (it.sets || 1) && Math.min.apply(null, vals) >= rg[1];
+}
+const lastWeight = last => { if (!last) return null; for (let i = last.sets.length - 1; i >= 0; i--) if (typeof last.sets[i].w === 'number') return last.sets[i].w; return null; };
+
+/* ---------- a workout as a flat list of steps ----------
+   ctx: { log, restAdj, firstGap }  ->  steps of kind ready | rest | reps | time                                  */
+function buildSteps(w, ctx) {
+  ctx = ctx || {};
+  const log = ctx.log || [], restAdj = ctx.restAdj || 0, steps = [];
+  const mainCount = w.main.length;
+  let prev = null, prevRest = 0, prevMainRef = null;
+  const gap = (kind, dur, block, next) => {
+    const g = { kind, block, dur: Math.max(kind === 'rest' ? 10 : 3, Math.round(dur)), next };
+    if (prevMainRef) { g.logRef = prevMainRef; prevMainRef = null; }
+    steps.push(g); return g;
+  };
+  ['warm', 'main', 'cool'].forEach(block => {
+    (w[block] || []).forEach((it, ei) => {
+      const x = EX[it.x]; if (!x) return;
+      const timed = itemTimed(it), sides = perSide(x), last = lastOf(log, it.x), target = targetOf(it, last);
+      const tl = timelineOf(x, it.tempo, it.hold, it.o), cues = cuesOf(x, it.o), sets = it.sets || 1, both = !timed && bothInRep(x);
+      const unit = timed ? 'sec' : 'reps';
+      const detail = timed ? spokenDur(target) + (sides ? ' each side' : it.rev ? ' each way' : '') : target + ' reps' + (sides ? ' each side' : both ? ' per side' : '');
+      for (let s = 1; s <= sets; s++) {
+        const parts = sides ? [{ side: 0, lab: 'Right side' }, { side: 1, lab: 'Left side' }] : it.rev ? [{ dir: 1, lab: it.revLab ? it.revLab[0] : 'One way' }, { dir: -1, lab: it.revLab ? it.revLab[1] : 'Other way' }] : [{}];
+        parts.forEach((pt, pi) => {
+          const o = Object.assign({}, it.o || {});
+          if (pt.side) o.mirror = true;
+          if (pt.dir) o.dir = pt.dir;
+          const kick = [];
+          if (block === 'main') kick.push(sets > 1 ? 'Set ' + s + ' of ' + sets : '1 set');
+          if (pt.lab) kick.push(pt.lab);
+          if (block !== 'main' && it.sub) kick.push(it.sub);
+          if (block === 'main' && it.note && s === 1 && pi === 0) kick.push(it.note);
+          const st = {
+            kind: timed ? 'time' : 'reps', block, exId: it.x, title: it.title || x.n, kicker: kick.join(' · '), anim: [famOf(x), o], tl, loop: loopOf(x, o),
+            reps: timed ? 0 : target, dur: timed ? target : target * cycleOf(tl), unit, range: timed ? (it.secs || [30, 30]) : it.reps,
+            cue: it.cue || (s === 1 && pi === 0 ? cues[1] : cues[2]), setup: cues[0], move: cues[1], note: it.note || '', detail, verb: verbOf(x, it.o), both,
+            ei, exNo: block === 'main' ? ei + 1 : 0, exCount: mainCount, setNo: s, sets, newMove: s === 1 && pi === 0, part: pi, parts: parts.length,
+            say: pi > 0 ? (pt.side ? 'Switch sides' : 'Reverse') : '', weighted: block === 'main' && isWeighted(x), approx: !!x.ax
+          };
+          // the pause before this step
+          if (!prev) gap('ready', it.gap !== undefined ? it.gap : (ctx.firstGap || 15), block, st);
+          else if (pi > 0) { if (pt.side) gap('ready', 6, block, st).switchSides = true; }
+          else if (block === 'main' && prev.block === 'main') gap('rest', (s > 1 ? it.rest : Math.max(prevRest, 20)) + restAdj, block, st);
+          else gap('ready', s > 1 ? (it.rest || 10) : block !== prev.block ? 20 : (it.gap === undefined ? 8 : it.gap), block, st);
+          steps.push(st); prev = st;
+          if (block === 'main' && pi === parts.length - 1) prevMainRef = { ei, si: s - 1 };
+        });
+        prevRest = it.rest || 0;
+      }
+    });
+  });
+  return steps;
+}
+function sessionTotals(steps) {
+  const t = { warm: 0, main: 0, cool: 0, total: 0, sets: 0 };
+  steps.forEach(s => { t[s.block] += s.dur; t.total += s.dur; if (s.block === 'main' && s.kind !== 'ready' && s.kind !== 'rest' && s.part === s.parts - 1) t.sets++; });
+  return t;
+}
+const workoutSeconds = (w, ctx) => sessionTotals(buildSteps(w, ctx)).total;
+
+/* ---------- numbers for the history screen ---------- */
+const DAY = 86400000;
+const weekStart = t => { const d = new Date(t); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); return d.getTime(); };   // Monday
+function sessionVolume(e) { let v = 0; (e.ex || []).forEach(q => q.sets.forEach(s => { if (s.d && typeof s.w === 'number' && typeof s.r === 'number') v += s.w * s.r; })); return v; }
+function sessionSets(e) { let n = 0; (e.ex || []).forEach(q => q.sets.forEach(s => { if (s.d) n++; })); return n; }
+function weekCount(log, now) { const a = weekStart(now); return log.filter(e => e.t >= a && e.t < a + 7 * DAY).length; }
+// weeks in a row (ending this week or last week) with at least `goal` sessions
+function weekStreak(log, goal, now) {
+  const by = {}; log.forEach(e => { const k = weekStart(e.t); by[k] = (by[k] || 0) + 1; });
+  const stepBack = t => weekStart(t - 3 * DAY);
+  let k = weekStart(now), n = 0;
+  if ((by[k] || 0) < goal) k = stepBack(k);
+  while ((by[k] || 0) >= goal) { n++; k = stepBack(k); }
+  return n;
+}
+// best set per exercise across the log: heaviest weight (then most reps), or most reps / longest hold without weight
+function recordsOf(log, exId) {
+  const r = { n: 0, last: 0, bestW: null, bestWr: null, bestR: null, bestS: null, hist: [] };
+  log.forEach(e => {
+    const q = (e.ex || []).find(z => z.x === exId); if (!q) return;
+    const done = q.sets.filter(s => s.d); if (!done.length) return;
+    r.n++; r.last = e.t;
+    let top = null;
+    done.forEach(s => {
+      if (typeof s.w === 'number' && (r.bestW === null || s.w > r.bestW || (s.w === r.bestW && (s.r || 0) > (r.bestWr || 0)))) { r.bestW = s.w; r.bestWr = s.r || null; }
+      if (typeof s.r === 'number' && (r.bestR === null || s.r > r.bestR)) r.bestR = s.r;
+      if (typeof s.s === 'number' && (r.bestS === null || s.s > r.bestS)) r.bestS = s.s;
+      const v = typeof s.w === 'number' ? s.w : typeof s.r === 'number' ? s.r : s.s;
+      if (top === null || v > top) top = v;
+    });
+    r.hist.push({ t: e.t, v: top, sets: done });
+  });
+  return r;
+}
+
+
+
+/* ===================== Plan builder: your answers in, a week of workouts out ===================== */
+const GOALS = [
+  ['strength', 'Build strength and muscle', 'Heavier sets with longer rests'],
+  ['fatloss', 'Lose weight', 'Short rests, more movement, cardio bursts'],
+  ['general', 'General fitness', 'A balanced mix for everyday strength'],
+  ['mobility', 'Mobility and flexibility', 'Stretching, loosening up and gentle core work']
+];
+const GOAL_NAME = {}; GOALS.forEach(g => { GOAL_NAME[g[0]] = g[1]; });
+const LEVELS = [['Beginner', 'New to training, or back after a long break'], ['Intermediate', 'Training regularly for six months or more'], ['Advanced', 'Years of consistent training']];
+const MINUTES = [15, 20, 30, 45, 60, 75, 90];
+const DEFAULT_PROFILE = { goal: 'general', level: 0, equip: [], days: 3, minutes: 30, lowImpact: false };
+
+// by original catalogue name, so the lists below stay readable
+const NAME_ID = {}; CATALOGUE.forEach(x => { NAME_ID[x.a || x.n] = x.id; });
+const N = name => { const id = NAME_ID[name] || (EX[name] ? name : null); if (!id) throw new Error('Unknown exercise: ' + name); return id; };
+
+function hash01(str) { let h = 2166136261; for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); } h ^= h >>> 13; h = Math.imul(h, 0x5bd1e995); h ^= h >>> 15; return (h >>> 0) / 4294967296; }
+
+/* ---------- which exercises this person can do ---------- */
+function haveSet(P) { const h = {}; (P.equip || []).forEach(t => { h[t] = 1; }); if (h.barbell) h.plate = 1; return h; }
+function usable(x, P, have) {
+  if (!x.f || !ANIMS[famOf(x)]) return false;
+  if (x.lv > P.level) return false;
+  if (P.lowImpact && (isImpact(x) || x.s === 'plyo')) return false;
+  const nd = x.nd || [];
+  for (let i = 0; i < nd.length; i++) if (!have[nd[i]]) return false;
+  return true;
+}
+const BY_SLOT = {};
+CATALOGUE.forEach(x => { if (x.f) (BY_SLOT[x.s] = BY_SLOT[x.s] || []).push(x); });
+
+const loadKind = x => { const nd = x.nd || []; return nd.indexOf('barbell') >= 0 ? 'barbell' : nd.indexOf('machine') >= 0 ? 'machine' : nd.indexOf('cable') >= 0 ? 'cable' : nd.indexOf('dumbbell') >= 0 ? 'dumbbell' : nd.indexOf('kettlebell') >= 0 ? 'kettlebell' : nd.indexOf('bands') >= 0 ? 'bands' : 'body'; };
+const LOAD_BONUS = [{ barbell: 2, machine: 5, cable: 4, dumbbell: 5, kettlebell: 3, bands: 3, body: 0 }, { barbell: 6, machine: 3, cable: 4, dumbbell: 5, kettlebell: 4, bands: 2, body: 0 }, { barbell: 7, machine: 3, cable: 4, dumbbell: 5, kettlebell: 4, bands: 1, body: 0 }];
+const EASY = { x_chair_squat: 1, x_wall_pushup: 1, x_knee_pushup: 1, x_knee_plank: 1 };            // gentler versions: right for beginners, too light later
+const TOUGH = {}; ['Pushups', 'Pullups', 'Chin-Up', 'Plank', 'Decline Push-Up'].forEach(n => { TOUGH[N(n)] = 1; });
+const NO_LOAD_SLOTS = { core: 1, cardio: 1, plyo: 1, stretch: 1 };
+const FALLBACK = { vpull: ['hpull', 'rear', 'hipIso'], hpull: ['vpull', 'rear', 'hipIso'], vpush: ['delts', 'hpush'], hpush: ['vpush', 'triceps'], kneeIso: ['knee'], hipIso: ['hip'], chestIso: ['hpush'],
+  rear: ['hpull', 'delts'], traps: ['rear'], delts: ['vpush'], biceps: [], triceps: [], forearms: [], hip: ['hipIso', 'knee'], knee: ['hip'], calves: [], core: [], cardio: ['plyo', 'core'], plyo: ['cardio', 'knee'] };
+
+/* Choose one exercise for a slot. st = { usedFam, usedId, planUse, seed, timed } */
+function pickFor(slot, P, have, st) {
+  const tryPool = (sl) => {
+    let best = null, bestScore = -1e9;
+    (BY_SLOT[sl] || []).forEach(x => {
+      if (!usable(x, P, have) || st.usedId[x.id]) return;
+      if (st.timed && (perSide(x) || ['barbell', 'machine', 'cable'].indexOf(loadKind(x)) >= 0 || isTimed(x) && x.s !== 'cardio' && x.s !== 'core')) return;
+      if (!st.timed && x.s === 'core' && x.f === 'carry') return;
+      let sc = x.p * 10;
+      if (x.p === 0) sc -= 60;
+      if (!NO_LOAD_SLOTS[x.s]) sc += LOAD_BONUS[P.level][loadKind(x)] * (P.goal === 'fatloss' || st.timed ? 0.4 : 1);
+      if (EASY[x.id]) sc += [5, -15, -30][P.level];
+      if (TOUGH[x.id] && P.level === 0) sc -= 6;
+      if (x.lv === P.level) sc += 1.5;
+      if (x.ax) sc -= 14;
+      if (x.u === 'side') sc -= 3;
+      if (st.usedFam[famOf(x)]) sc -= 100;
+      sc -= (st.planUse[x.id] || 0) * 7;
+      sc += hash01(st.seed + '|' + x.id) * 7;
+      if (sc > bestScore) { bestScore = sc; best = x; }
+    });
+    return bestScore > -40 ? best : null;
+  };
+  let x = tryPool(slot);
+  if (!x) { const fb = FALLBACK[slot] || []; for (let i = 0; i < fb.length && !x; i++) x = tryPool(fb[i]); }
+  if (x) { st.usedId[x.id] = 1; st.usedFam[famOf(x)] = 1; }
+  return x;
+}
+
+/* ---------- sets, reps and rests by goal, level and the job the exercise does ---------- */
+const RX = {
+  strength: { C: { sets: [3, 3, 4], reps: [[8, 12], [6, 10], [5, 8]], rest: [90, 105, 120], max: [3, 4, 5] }, A: { sets: [2, 3, 3], reps: [[10, 15], [10, 12], [8, 12]], rest: [60, 60, 75], max: [3, 3, 4] } },
+  general: { C: { sets: [2, 3, 3], reps: [[10, 12], [8, 12], [8, 12]], rest: [60, 75, 75], max: [3, 3, 4] }, A: { sets: [2, 2, 3], reps: [[12, 15], [10, 15], [10, 15]], rest: [45, 60, 60], max: [3, 3, 3] } },
+  fatloss: { C: { sets: [2, 3, 3], reps: [[12, 15], [12, 15], [12, 15]], rest: [45, 45, 40], max: [3, 3, 4] }, A: { sets: [2, 2, 3], reps: [[12, 15], [12, 15], [15, 20]], rest: [30, 30, 30], max: [3, 3, 3] } }
+};
+const COMPOUND = { knee: 1, hip: 1, hpush: 1, vpush: 1, hpull: 1, vpull: 1 };
+const HOLD_SECS = [[20, 30], [30, 45], [40, 60]];
+const BURST = [[30, 30], [40, 20], [45, 15]];                      // seconds of work, seconds of rest
+function makeItem(x, P, timedMode) {
+  const g = RX[P.goal] || RX.general, L = P.level;
+  if (timedMode) { const b = BURST[L]; return { x: x.id, sets: [2, 3, 3][L], secs: [b[0], b[0]], rest: b[1], max: [3, 4, 4][L], role: 'X' }; }
+  const role = COMPOUND[x.s] ? 'C' : 'A', r = g[role];
+  if (isTimed(x)) {
+    if (x.s === 'cardio') return { x: x.id, sets: 1, secs: [[180, 180], [240, 240], [300, 300]][L], rest: 30, max: 1, role: 'X' };
+    return { x: x.id, sets: g.A.sets[L], secs: HOLD_SECS[L], rest: g.A.rest[L], max: g.A.max[L], role: 'A' };
+  }
+  const it = { x: x.id, sets: r.sets[L], reps: r.reps[L], rest: r.rest[L], max: r.max[L], role };
+  if (bothInRep(x)) it.reps = [[8, 10], [10, 12], [12, 15]][L];
+  if (x.s === 'core' && !bothInRep(x)) it.reps = [[10, 15], [12, 15], [15, 20]][L];
+  if (x.s === 'plyo') { it.reps = [[6, 8], [8, 10], [8, 12]][L]; it.rest = Math.max(it.rest, 60); }
+  return it;
+}
+// seconds one item takes, at the middle of its range (used to fit the session to the time available)
+function itemSeconds(it, sets) {
+  const x = EX[it.x], timed = itemTimed(it), rg = timed ? (it.secs || [30, 30]) : it.reps, mid = (rg[0] + rg[1]) / 2;
+  const work = timed ? mid : mid * cycleOf(timelineOf(x, it.tempo, it.hold, it.o));
+  const sides = it.rev ? 2 : perSide(x) ? 2 : 1;
+  return (sets || it.sets || 1) * (work * sides + (perSide(x) ? 6 : 0) + (it.rest === undefined ? (it.gap === undefined ? 8 : it.gap) : it.rest));
+}
+
+/* ---------- the week ---------- */
+const TPL = {
+  full0: { name: 'Full body A', tag: 'Full body', area: 'full', core: 5, slots: ['knee', 'hpush', 'hpull', 'hip', 'core', 'vpush', 'vpull', 'triceps', 'biceps', 'calves', 'delts', 'rear', 'hipIso', 'core', 'chestIso', 'kneeIso'] },
+  full1: { name: 'Full body B', tag: 'Full body', area: 'full', core: 5, slots: ['hip', 'vpush', 'vpull', 'knee', 'core', 'hpush', 'hpull', 'biceps', 'triceps', 'calves', 'rear', 'delts', 'hipIso', 'core', 'chestIso'] },
+  full2: { name: 'Full body C', tag: 'Full body', area: 'full', core: 5, slots: ['knee', 'hpull', 'hpush', 'hip', 'core', 'delts', 'vpull', 'triceps', 'biceps', 'calves', 'vpush', 'rear', 'hipIso', 'core', 'kneeIso'] },
+  upper0: { name: 'Upper body A', tag: 'Chest, back, shoulders, arms', area: 'upper', core: 4, slots: ['hpush', 'hpull', 'vpush', 'vpull', 'triceps', 'biceps', 'rear', 'core', 'delts', 'chestIso', 'traps', 'forearms'] },
+  upper1: { name: 'Upper body B', tag: 'Back, shoulders, chest, arms', area: 'upper', core: 4, slots: ['vpull', 'vpush', 'hpull', 'hpush', 'delts', 'rear', 'biceps', 'triceps', 'core', 'chestIso', 'traps', 'forearms'] },
+  lower0: { name: 'Lower body A', tag: 'Legs, glutes, core', area: 'lower', core: 4, slots: ['knee', 'hip', 'knee', 'hipIso', 'calves', 'core', 'kneeIso', 'hip', 'core'] },
+  lower1: { name: 'Lower body B', tag: 'Glutes, hamstrings, legs, core', area: 'lower', core: 4, slots: ['hip', 'knee', 'hipIso', 'knee', 'kneeIso', 'core', 'calves', 'hip', 'core'] },
+  push0: { name: 'Push A', tag: 'Chest, shoulders, triceps', area: 'upper', core: 4, slots: ['hpush', 'vpush', 'hpush', 'triceps', 'delts', 'chestIso', 'triceps', 'core', 'delts'] },
+  push1: { name: 'Push B', tag: 'Shoulders, chest, triceps', area: 'upper', core: 4, slots: ['vpush', 'hpush', 'chestIso', 'triceps', 'delts', 'hpush', 'triceps', 'core'] },
+  pull0: { name: 'Pull A', tag: 'Back, rear shoulders, biceps', area: 'upper', core: 4, slots: ['vpull', 'hpull', 'hpull', 'biceps', 'rear', 'biceps', 'traps', 'core', 'forearms', 'vpull'] },
+  pull1: { name: 'Pull B', tag: 'Back, rear shoulders, biceps', area: 'upper', core: 4, slots: ['hpull', 'vpull', 'rear', 'biceps', 'vpull', 'hpull', 'traps', 'biceps', 'forearms', 'core'] },
+  legs0: { name: 'Legs A', tag: 'Legs, glutes, core', area: 'lower', core: 4, slots: ['knee', 'hip', 'knee', 'hipIso', 'kneeIso', 'calves', 'core', 'hip', 'core'] },
+  legs1: { name: 'Legs B', tag: 'Glutes, hamstrings, legs, core', area: 'lower', core: 4, slots: ['hip', 'knee', 'hipIso', 'knee', 'calves', 'kneeIso', 'core', 'knee', 'core'] },
+  // lose weight: strength moves with short rests, then timed bursts (slots ending in * are done for time)
+  burn0: { name: 'Full body burn A', tag: 'Whole body, short rests', area: 'full', core: 4, slots: ['knee', 'hpush', 'hpull', 'hip', 'cardio*', 'core', 'cardio*', 'vpush', 'core*', 'vpull', 'plyo*', 'calves'] },
+  burn1: { name: 'Full body burn B', tag: 'Whole body, short rests', area: 'full', core: 4, slots: ['hip', 'vpush', 'vpull', 'knee', 'cardio*', 'core', 'plyo*', 'hpush', 'core*', 'hpull', 'cardio*', 'hipIso'] },
+  burn2: { name: 'Full body burn C', tag: 'Whole body, short rests', area: 'full', core: 4, slots: ['knee', 'hpull', 'hpush', 'hip', 'cardio*', 'core', 'cardio*', 'delts', 'core*', 'vpull', 'plyo*', 'triceps'] },
+  cond0: { name: 'Conditioning A', tag: 'Timed bursts, whole body', area: 'full', core: 5, slots: ['cardio*', 'knee*', 'core*', 'cardio*', 'hpush*', 'hip*', 'core*', 'plyo*', 'hpull*', 'cardio*', 'core*', 'knee*'] },
+  cond1: { name: 'Conditioning B', tag: 'Timed bursts, whole body', area: 'full', core: 5, slots: ['cardio*', 'hip*', 'core*', 'plyo*', 'hpull*', 'knee*', 'core*', 'cardio*', 'hpush*', 'cardio*', 'core*', 'hip*'] },
+  cond2: { name: 'Conditioning C', tag: 'Timed bursts, whole body', area: 'full', core: 5, slots: ['cardio*', 'knee*', 'hpush*', 'core*', 'cardio*', 'hip*', 'plyo*', 'core*', 'hpull*', 'cardio*', 'knee*', 'core*'] }
+};
+const WEEK = {
+  lift: { 2: ['full0', 'full1'], 3: ['full0', 'full1', 'full2'], 4: ['upper0', 'lower0', 'upper1', 'lower1'], 5: ['upper0', 'lower0', 'push0', 'pull0', 'legs0'], 6: ['push0', 'pull0', 'legs0', 'push1', 'pull1', 'legs1'] },
+  fatloss: { 2: ['burn0', 'burn1'], 3: ['burn0', 'burn1', 'burn2'], 4: ['burn0', 'cond0', 'burn1', 'cond1'], 5: ['burn0', 'cond0', 'burn1', 'cond1', 'burn2'], 6: ['burn0', 'cond0', 'burn1', 'cond1', 'burn2', 'cond2'] }
+};
+
+/* ---------- warm-up: get warm, loosen the joints, rehearse the first move ---------- */
+function warmUp(area, P, have, seconds) {
+  const L = P.level, list = [];
+  const pulse = have.cardio ? N('Bicycling, Stationary') : 'x_march';
+  list.push({ x: pulse, secs: null, gap: 10, share: 1 });
+  list.push({ x: N('Arm Circles'), secs: [15, 15], rev: 1, revLab: ['Forward', 'Backward'], gap: 6 });
+  if (area !== 'upper') list.push({ x: 'x_hip_circles', secs: [15, 15], rev: 1, gap: 6 });
+  if (area !== 'upper') list.push({ x: N('Bodyweight Squat'), reps: [10, 10], tempo: [2, 1], sub: 'Easy pace', gap: 6 });
+  if (area !== 'lower') list.push({ x: L === 0 ? 'x_wall_pushup' : N('Incline Push-Up'), reps: [8, 8], tempo: [2, 1], sub: 'Easy pace', gap: 6 });
+  if (area === 'upper' && have.bands) list.push({ x: N('Band Pull Apart'), reps: [12, 12], tempo: [1, 1], sub: 'Light band', gap: 6 });
+  if (area !== 'lower') list.push({ x: N('Dynamic Chest Stretch'), secs: [20, 20], gap: 6 });
+  if (area !== 'upper') list.push({ x: N('Front Leg Raises'), reps: [8, 8], tempo: [1, 1], sub: 'Loose and easy', gap: 6 });
+  list.push({ x: N('Cat Stretch'), secs: [30, 30], gap: 8 });
+  // the fixed parts first, then whatever time is left goes to the pulse-raiser
+  const out = [list[0]]; let used = 0;
+  for (let i = 1; i < list.length; i++) { const t = itemSeconds(list[i]); if (used + t <= seconds - 45 || out.length < 3) { out.push(list[i]); used += t; } }
+  const walk = clamp(Math.round((seconds - used - 10) / 15) * 15, 45, 240);
+  out[0].secs = [walk, walk]; delete out[0].share;
+  return out;
+}
+
+/* ---------- cool-down: stretch what was worked ---------- */
+const STRETCH_FOR = {
+  calves: ['Calf Stretch Hands Against Wall'], hamstrings: ['Standing Toe Touches', 'Seated Floor Hamstring Stretch'], quadriceps: ['Quad Stretch', 'Kneeling Hip Flexor'],
+  glutes: ['One Knee To Chest', 'Knee Across The Body'], adductors: ['Groin and Back Stretch'], abductors: ['Knee Across The Body'],
+  'lower back': ["Child's Pose", 'Hug Knees To Chest'], 'middle back': ["Child's Pose", 'Upward Stretch'], lats: ['Standing Lateral Stretch', 'Upward Stretch'], traps: ['Side Neck Stretch'],
+  chest: ['Chest And Front Of Shoulder Stretch'], shoulders: ['Shoulder Stretch'], triceps: ['Triceps Stretch'], biceps: ['Chest And Front Of Shoulder Stretch'], forearms: [],
+  abdominals: ['Upward Stretch', 'Cat Stretch'], neck: ['Side Neck Stretch']
+};
+function coolDown(main, P, seconds) {
+  const w = {}; main.forEach((it, i) => { const x = EX[it.x]; (x.m || []).forEach(m => { w[m] = (w[m] || 0) + (it.sets || 1) + (main.length - i) * 0.01; }); (x.m2 || []).slice(0, 2).forEach(m => { w[m] = (w[m] || 0) + 0.4; }); });
+  const order = Object.keys(w).sort((a, b) => w[b] - w[a]), hold = seconds < 150 ? 20 : 30, out = [], seen = {};
+  let used = 0;
+  const add = name => {
+    const id = N(name); if (seen[id]) return;
+    const it = { x: id, secs: [hold, hold], gap: out.length ? 8 : 15 }, t = itemSeconds(it);
+    if (used + t > seconds + 10 && out.length >= 2) return;
+    seen[id] = 1; out.push(it); used += t;
+  };
+  order.forEach(m => { const c = STRETCH_FOR[m] || []; if (c.length) add(c[0]); });
+  order.forEach(m => { const c = STRETCH_FOR[m] || []; if (c.length > 1) add(c[1]); });
+  ["Child's Pose", 'Standing Toe Touches', 'Upward Stretch'].forEach(n => { if (out.length < 2 || used < seconds - 60) add(n); });
+  return out;
+}
+
+/* ---------- one strength-type workout, fitted to the minutes available ---------- */
+function buildWorkout(key, P, seed, planUse, idx) {
+  const tpl = TPL[key], have = haveSet(P), budget = P.minutes * 60, L = P.level;
+  const warmT = clamp(Math.round(budget * 0.11 / 30) * 30, 120, 330), coolT = clamp(Math.round(budget * 0.09 / 30) * 30, 90, 300);
+  const mainBudget = budget - warmT - coolT - 35;
+  const st = { usedFam: {}, usedId: {}, planUse, seed: seed + '|' + key, timed: false };
+  const cand = [];
+  tpl.slots.forEach(sl => {
+    const timedMode = sl.slice(-1) === '*', slot = timedMode ? sl.slice(0, -1) : sl;
+    st.timed = timedMode;
+    const x = pickFor(slot, P, have, st);
+    if (x) cand.push(makeItem(x, P, timedMode));
+  });
+  // 1) the essentials at two sets, 2) bring them up to their normal sets, 3) add the rest, 4) extra sets if there is still time
+  const chosen = []; let used = 0;
+  const cost = (it, n) => itemSeconds(it, n);
+  cand.forEach((it, i) => {
+    if (i >= tpl.core) return;
+    const n = Math.min(2, it.sets);
+    if (used + cost(it, n) <= mainBudget || chosen.length < 2) { chosen.push(Object.assign({}, it, { sets: n, want: it.sets, order: i })); used += cost(it, n); }
+  });
+  let grew = true;
+  while (grew) { grew = false; chosen.forEach(c => { if (c.sets < c.want && used + cost(c, 1) <= mainBudget) { c.sets++; used += cost(c, 1); grew = true; } }); }
+  cand.forEach((it, i) => {
+    if (i < tpl.core) return;
+    const n = used + cost(it, it.sets) <= mainBudget ? it.sets : (it.sets > 2 && used + cost(it, 2) <= mainBudget) ? 2 : 0;
+    if (n) { chosen.push(Object.assign({}, it, { sets: n, want: it.sets, order: i })); used += cost(it, n); }
+  });
+  grew = true;
+  while (grew) { grew = false; chosen.forEach(c => { if (c.sets < c.max && used + cost(c, 1) <= mainBudget) { c.sets++; used += cost(c, 1); grew = true; } }); }
+  grew = true;                                                   // few exercises fit this equipment: fill the time with extra sets, up to five
+  while (grew) { grew = false; chosen.forEach(c => { if (c.role !== 'X' && c.sets < 5 && used + cost(c, 1) <= mainBudget) { c.sets++; used += cost(c, 1); grew = true; } }); }
+  chosen.sort((a, b) => a.order - b.order);
+  const main = chosen.map(c => { const it = { x: c.x, sets: c.sets, rest: c.rest }; if (c.reps) it.reps = c.reps; if (c.secs) it.secs = c.secs; return it; });
+  main.forEach(it => { planUse[it.x] = (planUse[it.x] || 0) + 1; });
+  return { id: 'w' + idx, key, name: tpl.name, tag: tpl.tag, warm: warmUp(tpl.area, P, have, warmT), main, cool: coolDown(main, P, coolT) };
+}
+
+/* ---------- mobility sessions: a flow of stretches with a little control work ---------- */
+const FLOW = {
+  mobA: { name: 'Mobility A', tag: 'Whole body', list: ['Cat Stretch', "Child's Pose", 'Kneeling Hip Flexor', 'Standing Toe Touches', 'Chest And Front Of Shoulder Stretch', 'One Knee To Chest', 'Shoulder Stretch', 'Groin and Back Stretch',
+    'Standing Lateral Stretch', 'Quad Stretch', 'Triceps Stretch', 'Knee Across The Body', 'Upward Stretch', 'Calf Stretch Hands Against Wall', 'Side Neck Stretch', 'Spinal Stretch'], work: ['Dead Bug', 'Butt Lift (Bridge)', 'Superman'] },
+  mobB: { name: 'Mobility B', tag: 'Hips and legs', list: ['Kneeling Hip Flexor', 'Seated Floor Hamstring Stretch', 'Groin and Back Stretch', 'Quad Stretch', 'One Knee To Chest', 'Knee Across The Body', 'Adductor/Groin',
+    'Calf Stretch Hands Against Wall', 'Leg-Up Hamstring Stretch', "Child's Pose", 'Standing Toe Touches', 'Hug Knees To Chest', 'Spinal Stretch'], work: ['Butt Lift (Bridge)', 'Bodyweight Squat', 'Glute Kickback'] },
+  mobC: { name: 'Mobility C', tag: 'Shoulders, chest and spine', list: ['Cat Stretch', 'Chest And Front Of Shoulder Stretch', 'Shoulder Stretch', 'Triceps Stretch', 'Upward Stretch', 'Standing Lateral Stretch', "Child's Pose", 'Side Neck Stretch',
+    'Chin To Chest Stretch', 'Spinal Stretch', 'Elbows Back', 'Overhead Stretch', 'Knee Across The Body', 'Chair Lower Back Stretch'], work: ['Dead Bug', 'Superman', 'Band Pull Apart'] }
+};
+const ROLLS = ['Quadriceps-SMR', 'Calves-SMR', 'Latissimus Dorsi-SMR', 'Hamstring-SMR', 'Lower Back-SMR'];
+function buildFlow(key, P, seed, idx) {
+  const F = FLOW[key], have = haveSet(P), budget = P.minutes * 60, L = P.level, hold = [30, 40, 45][L];
+  const warmT = clamp(Math.round(budget * 0.12 / 30) * 30, 90, 240), mainBudget = budget - warmT - 30;
+  const warm = warmUp(key === 'mobC' ? 'upper' : key === 'mobB' ? 'lower' : 'full', P, have, warmT).filter(it => it.x !== N('Cat Stretch'));
+  const q = [];
+  F.work.forEach((n, i) => { const x = EX[N(n)]; if (usable(x, { level: 2, lowImpact: P.lowImpact }, have)) q.push({ at: 2 + i * 4, it: { x: x.id, sets: 2, reps: bothInRep(x) ? [8, 10] : [10, 12], rest: 30, tempo: [2, 2] } }); });
+  if (have.foamroll) ROLLS.slice(0, 3).forEach((n, i) => q.push({ at: 1 + i * 5, it: { x: N(n), sets: 1, secs: [45, 45], rest: 10 } }));
+  const main = []; let used = 0;
+  const push = it => { const t = itemSeconds(it); if (used + t <= mainBudget || main.length < 3) { main.push(it); used += t; return true; } return false; };
+  F.list.forEach((n, i) => { q.filter(z => z.at === i).forEach(z => push(z.it)); push({ x: N(n), sets: 1, secs: [hold, hold], rest: 10 }); });
+  // time left over: go round the first stretches again
+  let k = 0, guard = 0;
+  while (used < mainBudget - 60 && guard++ < 40) { const it = main[k++ % main.length]; if (itemTimed(it) && it.sets < 3 && used + itemSeconds(it, 1) <= mainBudget) { it.sets++; used += itemSeconds(it, 1); } }
+  return { id: 'w' + idx, key, name: F.name, tag: F.tag, warm, main, cool: [] };
+}
+
+/* ---------- the plan ---------- */
+function buildPlan(profile, seed) {
+  const P = Object.assign({}, DEFAULT_PROFILE, profile);
+  P.days = clamp(Math.round(P.days) || 3, 2, 6); P.level = clamp(Math.round(P.level) || 0, 0, 2);
+  P.minutes = MINUTES.indexOf(P.minutes) >= 0 ? P.minutes : 30;
+  seed = seed || 1;
+  let workouts;
+  if (P.goal === 'mobility') workouts = ['mobA', 'mobB', 'mobC', 'mobA', 'mobB', 'mobC'].slice(0, P.days).map((k, i) => { const w = buildFlow(k, P, seed, i); if (i >= 3) w.name += ' (repeat)'; return w; });
+  else {
+    const keys = (P.goal === 'fatloss' ? WEEK.fatloss : WEEK.lift)[P.days], planUse = {};
+    workouts = keys.map((k, i) => buildWorkout(k, P, String(seed), planUse, i));
+  }
+  return { kind: 'custom', v: 1, seed, created: 0, profile: P, workouts };
+}
+
+/* Other exercises that could stand in for one item: same job, fits the equipment, best matches first. */
+function alternatives(exId, P, limit, anyEquip) {
+  const x = EX[exId], have = haveSet(P), pool = [];
+  const slots = [x.s].concat(FALLBACK[x.s] || []);
+  CATALOGUE.forEach(y => {
+    if (y.id === exId || !y.f || !ANIMS[famOf(y)] || slots.indexOf(y.s) < 0) return;
+    if (!anyEquip && !(y.nd || []).every(t => have[t])) return;
+    if (P.lowImpact && isImpact(y)) return;
+    let sc = y.p * 10 + (y.s === x.s ? 20 : 0) - (y.ax ? 10 : 0) - Math.max(0, y.lv - P.level) * 15 + (isTimed(y) === isTimed(x) ? 6 : 0);
+    if (x.s === 'stretch') sc += (y.m[0] === x.m[0] ? 25 : 0);
+    pool.push([sc, y]);
+  });
+  pool.sort((a, b) => b[0] - a[0] || (a[1].n < b[1].n ? -1 : 1));
+  return pool.slice(0, limit || 40).map(p => p[1]);
+}
+// a replacement item that keeps the sets and rest of the one it replaces
+function swapItem(it, newId, P) {
+  const x = EX[newId], fresh = makeItem(x, Object.assign({}, DEFAULT_PROFILE, P), !!it.secs && !isTimed(EX[it.x]));
+  const out = { x: newId, sets: it.sets || fresh.sets, rest: it.rest === undefined ? fresh.rest : it.rest };
+  if (it.gap !== undefined) out.gap = it.gap;
+  if (isTimed(x)) out.secs = it.secs || fresh.secs || [30, 30];
+  else if (it.secs && !it.reps) out.secs = it.secs;
+  else out.reps = (it.reps && bothInRep(x) === bothInRep(EX[it.x])) ? it.reps : fresh.reps || [10, 12];
+  return out;
+}
+
+
+
+/* ===================== The ready-made 12-week programme (Mon / Wed / Fri, bands and a chair) ===================== */
+const PHASES = [
+  { n: 1, from: 1, to: 2, tab: '1–2', scheme: '2 sets × 10–12 reps, easy bands, learn the form', walk: '20–30 min (~5,000 steps)',
+    focus: 'Build the habit, hit protein daily', effort: '3', rest: [60, 90], tempo: [2, 1], band: 'Light' },
+  { n: 2, from: 3, to: 4, tab: '3–4', scheme: '3 sets × 10–12 reps', walk: '~6,000–7,000 steps',
+    focus: 'Add reps before changing bands. Check-in at week 4', effort: '2–3', rest: [60, 90], tempo: [2, 1], band: 'Light' },
+  { n: 3, from: 5, to: 8, tab: '5–8', scheme: '3 sets × 12–15 reps, move to a stronger band', walk: '~7,000–8,000 steps',
+    focus: 'Add 1 extra low-impact session (bike or pool if you can). Check-in at week 8', effort: '1–2', rest: [60, 60], tempo: [2, 1], band: 'Light → medium' },
+  { n: 4, from: 9, to: 12, tab: '9–12', scheme: '4 sets on the main moves (squat, row, push-up), slow 3-second lowering', walk: '~8,000–10,000 steps',
+    focus: 'Push progress. Check-in at week 12', effort: '1–2', rest: [60, 60], tempo: [3, 1], band: 'Medium → heavy' }
+];
+const phaseOf = w => (w <= 2 ? 1 : w <= 4 ? 2 : w <= 8 ? 3 : 4);
+const CHECKIN_WEEKS = [4, 8, 12];
+const CHECKIN_TEXT = 'Compare your weekly average weight and your waist measurement. If the average hasn\'t moved for 2 full weeks, cut about 100–150 kcal or add 1,000–2,000 steps a day. Don\'t do both at once.';
+const P12_NOTES = [
+  ['Drink water', 'throughout the day, plus unsweetened tea or coffee.'],
+  ['Eat plenty of non-starchy vegetables.', 'They keep you full and supply fiber and potassium on a low-carb diet.'],
+  ['Train after your first meal', 'on most days. Lifting on an empty stomach is possible but makes dizziness more likely.'],
+  ['If a dish has a lot of carbs', '(bread, rice, sugar in sauces), swap it for the vegetable side.']
+];
+const PROGRESS_RULES = [
+  ['You finish all sets and reps with 3+ reps to spare', 'Add reps first (up to the top of the range)'],
+  ['You hit the top of the rep range on every set', 'Move to the next band, incline, or harder variation, and drop back to the low end of the range'],
+  ['Form breaks down (knees caving, back sagging, shoulders shrugging)', 'Stay at the same level or step back one'],
+  ['A set feels impossible', 'Do fewer reps, keep the same band, and rest long']
+];
+/* rx[phase-1] = sets, rep range (or seconds), and the document's own note for that phase */
+const P12 = {
+  squat: { doc: 'Sit down, stand up', rx: [{ sets: 2, r: [10, 12], note: 'Easy tempo' }, { sets: 3, r: [10, 12] }, { sets: 3, r: [12, 15], note: 'Band across your chest or under your feet' }, { sets: 4, r: [12, 12], note: '3 sec lowering' }] },
+  row: { doc: 'Band anchored at chest height, pull elbows back', rx: [{ sets: 2, r: [10, 12], note: 'Light band' }, { sets: 3, r: [10, 12] }, { sets: 3, r: [12, 15], note: 'Medium band' }, { sets: 4, r: [12, 12], note: '3 sec lowering, 1 sec squeeze' }] },
+  push: { doc: 'Wall, then incline, then knees on the foam pad', rx: [{ sets: 2, r: [10, 12], note: 'On the wall' }, { sets: 3, r: [10, 12], note: 'Lower the incline slightly' }, { sets: 3, r: [12, 15], note: 'Incline or knees' }, { sets: 4, r: [10, 12], note: '3 sec lowering, hardest version you control' }],
+    variants: { wall: ['Wall', 'x_wall_pushup'], incline: ['Incline', 'Incline_Push-Up'], knees: ['Knees', 'x_knee_pushup'] }, def: ['wall', 'incline', 'incline', 'knees'] },
+  bridge: { doc: 'On the mat', rx: [{ sets: 2, r: [12, 12] }, { sets: 3, r: [12, 12] }, { sets: 3, r: [15, 15], note: 'Band above the knees' }, { sets: 3, r: [15, 15], note: '2 sec hold at the top' }] },
+  press: { doc: 'Stand on the band', rx: [{ sets: 2, r: [10, 10] }, { sets: 3, r: [10, 10] }, { sets: 3, r: [12, 12], note: 'Stronger band' }, { sets: 3, r: [12, 12], note: '3 sec lowering' }] },
+  deadbug: { doc: 'Core', rx: [{ sets: 2, r: [8, 8] }, { sets: 3, r: [8, 8] }, { sets: 3, r: [10, 10], note: 'Or a 20–30 sec plank' }, { sets: 3, r: [12, 12], note: 'Or a 30–45 sec plank' }] },
+  plank: { doc: 'Knees on the foam pad', rx: [null, null, { sets: 3, r: [20, 30] }, { sets: 3, r: [30, 45] }] }
+};
+const P12_EQUIP = ['bands', 'mball'];
+const p12Rest = (ph, plan) => { const r = PHASES[ph - 1].rest; return r[0] === r[1] ? r[0] : clamp(plan.rest || 75, r[0], r[1]); };
+const p12PushVar = (plan, ph) => (P12.push.variants[plan.pushVar] ? plan.pushVar : P12.push.def[ph - 1]);
+const p12Core = (plan, ph) => (ph >= 3 && plan.core === 'plank' ? 'plank' : 'deadbug');
+
+/* The session for a given week, in the same shape the builder produces. */
+function p12Workout(plan) {
+  const wk = clamp(plan.week || 1, 1, 12), ph = phaseOf(wk), P = PHASES[ph - 1], rest = p12Rest(ph, plan), tempo = P.tempo;
+  const mk = (key, x, extra) => { const rx = P12[key].rx[ph - 1]; return Object.assign({ x, sets: rx.sets, reps: rx.r, rest, tempo, note: rx.note || '', slot: key }, extra || {}); };
+  const core = p12Core(plan, ph), cr = P12[core].rx[ph - 1];
+  const main = [
+    mk('squat', 'x_chair_squat', ph >= 3 ? { o: { load: 'band' }, title: 'Chair squat' } : { title: 'Chair squat' }),
+    mk('row', 'x_band_row', { title: 'Band row', hold: ph === 4 ? 1 : 0 }),
+    mk('push', P12.push.variants[p12PushVar(plan, ph)][1]),
+    mk('bridge', N('Butt Lift (Bridge)'), ph >= 3 ? { o: { band: 1 }, hold: ph === 4 ? 2 : 0 } : {}),
+    mk('press', N('Shoulder Press - With Bands')),
+    core === 'plank' ? { x: 'x_knee_plank', sets: cr.sets, secs: cr.r, rest, note: '', slot: 'core', title: 'Plank' } : mk('deadbug', N('Dead Bug'), { slot: 'core' })
+  ];
+  const warm = [
+    { x: 'x_march', secs: [180, 180], gap: 10, title: 'Brisk walk', sub: 'In place or around the house, in shoes', cue: 'Walk briskly in place or around the house, in shoes. Swing your arms until you feel warm.' },
+    { x: N('Arm Circles'), secs: [15, 15], rev: 1, revLab: ['Forward', 'Backward'], gap: 6 },
+    { x: 'x_hip_circles', secs: [15, 15], rev: 1, gap: 6 },
+    { x: N('Bodyweight Squat'), reps: [10, 10], tempo: [2, 1], gap: 6, title: 'Bodyweight squats', sub: 'Easy pace', cue: '10 easy squats to wake up your hips and knees. Only go as low as feels comfortable.' }
+  ];
+  const cool = [
+    { x: N('Calf Stretch Hands Against Wall'), secs: [30, 30], gap: 20, title: 'Calf stretch' },
+    { x: 'x_plantar', secs: [30, 30], gap: 8 },
+    { x: N('Foot-SMR'), secs: [60, 60], gap: 10, title: 'Massage ball' }
+  ];
+  return { id: 'p12', key: 'p12', name: 'Week ' + wk + ' session', tag: 'Weeks ' + P.tab + ' · ' + P.band + ' band', warm, main, cool, week: wk, phase: ph };
+}
+
+
+
+/* ===================== App: set-up, today, plan, history, library, settings, guided player ===================== */
+(function () {
+  'use strict';
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const fmtClock = s => { s = Math.max(0, Math.ceil(s)); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
+  const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  const VERSION = '1.0';
+
+  /* ---------- saved state (kept on this device) ---------- */
+  const LS_KEY = 'gw.state.v1', RUN_KEY = 'gw.run.v1';
+  const DEF_SET = { sound: 'voice', pace: 'guided', restAdj: 0, units: 'kg', theme: 'auto' };
+  const blank = () => ({ v: 1, profile: null, plan: null, saved: null, next: 0, settings: Object.assign({}, DEF_SET), log: [], seedN: 1, updatedAt: 0, tipInstall: 0 });
+  const cleanItems = a => (Array.isArray(a) ? a.filter(it => it && EX[it.x] && EX[it.x].f) : []);
+  function normPlan(p) {
+    if (!p || typeof p !== 'object') return null;
+    if (p.kind === 'p12') return { kind: 'p12', week: clamp(Math.round(+p.week) || 1, 1, 12), rest: [60, 75, 90].indexOf(+p.rest) >= 0 ? +p.rest : 60, pushVar: P12.push.variants[p.pushVar] ? p.pushVar : '', core: p.core === 'plank' ? 'plank' : 'deadbug' };
+    if (!Array.isArray(p.workouts)) return null;
+    const ws = p.workouts.map((w, i) => ({ id: w.id || 'w' + i, key: w.key || '', name: String(w.name || 'Workout ' + (i + 1)), tag: String(w.tag || ''), warm: cleanItems(w.warm), main: cleanItems(w.main), cool: cleanItems(w.cool) })).filter(w => w.main.length);
+    return ws.length ? { kind: 'custom', v: 1, seed: p.seed || 1, created: +p.created || 0, profile: p.profile || null, workouts: ws } : null;
+  }
+  function norm(d) {
+    const s = Object.assign(blank(), d || {});
+    s.v = 1;
+    s.settings = Object.assign({}, DEF_SET, s.settings || {});
+    if (['voice', 'beeps', 'off'].indexOf(s.settings.sound) < 0) s.settings.sound = 'voice';
+    if (['guided', 'own'].indexOf(s.settings.pace) < 0) s.settings.pace = 'guided';
+    if ([-15, 0, 15, 30].indexOf(+s.settings.restAdj) < 0) s.settings.restAdj = 0; else s.settings.restAdj = +s.settings.restAdj;
+    if (['kg', 'lb'].indexOf(s.settings.units) < 0) s.settings.units = 'kg';
+    if (['auto', 'light', 'dark'].indexOf(s.settings.theme) < 0) s.settings.theme = 'auto';
+    s.plan = normPlan(s.plan); s.saved = normPlan(s.saved);
+    if (s.profile && typeof s.profile === 'object') { s.profile = Object.assign({}, DEFAULT_PROFILE, s.profile); s.profile.equip = Array.isArray(s.profile.equip) ? s.profile.equip.filter(t => EQUIP_NAME[t]) : []; } else s.profile = null;
+    s.log = Array.isArray(s.log) ? s.log.filter(e => e && typeof e.t === 'number' && Array.isArray(e.ex)).slice(-1000) : [];
+    s.next = Math.max(0, Math.round(+s.next) || 0); s.seedN = Math.max(1, Math.round(+s.seedN) || 1); s.updatedAt = +s.updatedAt || 0;
+    return s;
+  }
+  let storageOK = false;
+  try { localStorage.setItem('gw.probe', '1'); localStorage.removeItem('gw.probe'); storageOK = true; } catch (e) { }
+  function loadLocal() { try { const raw = localStorage.getItem(LS_KEY); if (raw) return norm(JSON.parse(raw)); } catch (e) { } return norm({}); }
+  function saveLocal() { try { localStorage.setItem(LS_KEY, JSON.stringify(S)); } catch (e) { } }
+  let S = loadLocal();
+  function commit() { S.updatedAt = Date.now(); saveLocal(); cloudSave(); }
+  try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) { }
+
+  /* when the page runs as a Claude artifact, the same state is also kept in the page's own database */
+  let cloudRef = null, cloudTimer = 0, cloudChain = Promise.resolve(), cloudOn = false;
+  async function cloudInit() {
+    try {
+      if (!window.claude || typeof window.claude.use !== 'function') return;
+      const got = await Promise.all([window.claude.use('db'), window.claude.use('user')]);
+      if (!got[0] || !got[1]) return;
+      const uid = await got[1].id(); if (!uid) return;
+      const ref = got[0].doc('data/users/' + uid + '/state'), snap = await ref.get();
+      cloudRef = ref; cloudOn = true;
+      if (snap.exists) {
+        const remote = norm(JSON.parse(JSON.stringify(snap.data() || {})));
+        if (remote.updatedAt > S.updatedAt) { S = remote; saveLocal(); applyTheme(); render(); } else if (S.updatedAt > remote.updatedAt) cloudSave();
+      } else if (S.updatedAt) cloudSave();
+    } catch (e) { cloudRef = null; }
+  }
+  function cloudSave() {
+    if (!cloudRef) return;
+    clearTimeout(cloudTimer);
+    cloudTimer = setTimeout(() => { const body = JSON.parse(JSON.stringify(S)); body.log = body.log.slice(-150); cloudChain = cloudChain.then(() => cloudRef.set(body)).catch(() => { }); }, 900);
+  }
+
+  /* ---------- units ---------- */
+  const LB = 2.20462;
+  const wShow = kg => (kg == null ? '' : S.settings.units === 'lb' ? String(Math.round(kg * LB * 2) / 2) : String(Math.round(kg * 2) / 2));
+  const wStore = v => (S.settings.units === 'lb' ? v / LB : v);
+  const wStep = () => (S.settings.units === 'lb' ? 2.5 : 1);
+  const unit = () => S.settings.units;
+
+  /* ---------- sound ---------- */
+  const Snd = {
+    ctx: null, enVoice: null,
+    canSpeak: typeof window.speechSynthesis !== 'undefined' && typeof window.SpeechSynthesisUtterance !== 'undefined',
+    unlock() { try { const AC = window.AudioContext || window.webkitAudioContext; if (AC && !this.ctx) this.ctx = new AC(); if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume(); } catch (e) { } this.pickVoice(); },
+    pickVoice() { if (!this.canSpeak) return; try { const vs = window.speechSynthesis.getVoices() || []; this.enVoice = vs.find(v => /^en[-_]US/i.test(v.lang)) || vs.find(v => /^en/i.test(v.lang)) || null; } catch (e) { } },
+    tone(freq, dur, when, vol) {
+      if (S.settings.sound === 'off' || !this.ctx) return;
+      try {
+        const t = this.ctx.currentTime + (when || 0), o = this.ctx.createOscillator(), g = this.ctx.createGain();
+        o.type = 'sine'; o.frequency.value = freq;
+        g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(vol || 0.3, t + 0.015); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+        o.connect(g); g.connect(this.ctx.destination); o.start(t); o.stop(t + dur + 0.05);
+      } catch (e) { }
+    },
+    cue(n) {
+      if (n === 'down') this.tone(392, 0.13); else if (n === 'up') this.tone(587, 0.13); else if (n === 'hold') this.tone(494, 0.1); else if (n === 'tick') this.tone(880, 0.09);
+      else if (n === 'go') this.tone(1047, 0.32); else if (n === 'rest') { this.tone(784, 0.16); this.tone(523, 0.3, 0.17); } else if (n === 'ready') this.tone(660, 0.18);
+      else if (n === 'done') { this.tone(523, 0.16); this.tone(659, 0.16, 0.17); this.tone(784, 0.16, 0.34); this.tone(1047, 0.5, 0.51); }
+    },
+    say(text) {
+      if (S.settings.sound !== 'voice' || !this.canSpeak || !text) return;
+      try { const ss = window.speechSynthesis; if (ss.speaking || ss.pending) ss.cancel(); const u = new SpeechSynthesisUtterance(text); u.lang = 'en-US'; if (this.enVoice) u.voice = this.enVoice; u.rate = 1.02; ss.speak(u); } catch (e) { }
+    },
+    hush() { try { if (this.canSpeak) window.speechSynthesis.cancel(); } catch (e) { } }
+  };
+  if (Snd.canSpeak) { try { window.speechSynthesis.addEventListener('voiceschanged', () => Snd.pickVoice()); } catch (e) { } }
+  if (!Snd.canSpeak && S.settings.sound === 'voice') S.settings.sound = 'beeps';
+
+  /* ---------- drawing ---------- */
+  function drawDemo(stage, anim, tl, time, loop) {
+    stage.set(anim[0], anim[1]);
+    if (tl) {
+      let x = time % cycleOf(tl);
+      for (let i = 0; i < tl.length; i++) { const p = tl[i]; if (x < p.d) { stage.draw(p.lin ? lerp(p.a, p.b, x / p.d) : lerp(p.a, p.b, easeIO(x / p.d)), p.side); return p; } x -= p.d; }
+      return tl[0];
+    }
+    const L = loop || 3; stage.draw(0, (time % L) / L); return null;
+  }
+  function thumbHtml(x, cls) { return x && x.f ? '<span class="thumb ' + (cls || '') + '"><svg data-th="' + esc(x.id) + '"></svg></span>' : '<span class="thumb none ' + (cls || '') + '">No demo</span>'; }
+  function paintThumbs(root) {
+    (root || document).querySelectorAll('svg[data-th]').forEach(svg => {
+      const x = EX[svg.dataset.th]; svg.removeAttribute('data-th'); if (!x || !x.f) return;
+      try { const st = new Stage(svg, true), a = animOf(x); st.set(a[0], a[1]); st.draw(isTimed(x) ? 0 : 0.8, 0.3); } catch (e) { }
+    });
+  }
+  const musText = x => (x.m || []).map(m => m.charAt(0).toUpperCase() + m.slice(1)).join(', ');
+
+  /* ---------- the plan in use ---------- */
+  const UI = { tab: 'today', pick: null, ob: null, lib: { q: '', area: 'All', mine: false, n: 40 } };
+  const isP12 = () => !!S.plan && S.plan.kind === 'p12';
+  const workouts = () => (isP12() ? [p12Workout(S.plan)] : S.plan ? S.plan.workouts : []);
+  const curIdx = () => { const n = workouts().length; return n ? clamp(UI.pick == null ? S.next % n : UI.pick, 0, n - 1) : 0; };
+  const curW = () => workouts()[curIdx()];
+  const ctx = () => ({ log: S.log, restAdj: S.settings.restAdj });
+  const profile = () => (isP12() ? Object.assign({}, DEFAULT_PROFILE, S.profile || {}, { equip: ((S.profile && S.profile.equip) || []).concat(P12_EQUIP) }) : Object.assign({}, DEFAULT_PROFILE, S.profile || {}));
+  const weekDone12 = w => S.log.filter(e => e.kind === 'p12' && e.week === w).length;
+  function toast(msg) { const t = $('toast'); t.textContent = msg; t.hidden = false; clearTimeout(toast.h); toast.h = setTimeout(() => { t.hidden = true; }, 2600); }
+  function applyTheme() { const r = document.documentElement; if (S.settings.theme === 'auto') r.removeAttribute('data-theme'); else r.setAttribute('data-theme', S.settings.theme); }
+
+  /* ---------- overlays and the phone's back button ---------- */
+  const Nav = {
+    closers: [], hist: true,
+    open(fn) { this.closers.push(fn); try { history.pushState({ gw: this.closers.length }, ''); } catch (e) { this.hist = false; } },
+    close() { if (!this.closers.length) return; if (this.hist) { try { history.back(); return; } catch (e) { } } this.pop(); },
+    pop() { const c = this.closers.pop(); if (c) c(); }
+  };
+  window.addEventListener('popstate', () => Nav.pop());
+
+  /* =========================== SET-UP =========================== */
+  const OB_STEPS = ['welcome', 'goal', 'level', 'equip', 'time', 'preview'];
+  function startSetup(fromScratch) {
+    UI.ob = { step: fromScratch ? 0 : 1, P: Object.assign({}, DEFAULT_PROFILE, S.profile || {}), plan: null, redo: !fromScratch };
+    UI.ob.P.equip = (UI.ob.P.equip || []).slice();
+    render();
+  }
+  function renderSetup() {
+    const o = UI.ob, P = o.P, st = OB_STEPS[o.step], v = $('view');
+    $('app').classList.add('bare'); $('tabs').hidden = true;
+    const prog = st === 'welcome' ? '' : '<div class="ob-prog">' + [1, 2, 3, 4, 5].map(i => '<i class="' + (i <= o.step ? 'f' : '') + '"></i>').join('') + '</div>';
+    let h = '', next = 'Next', canNext = true;
+    if (st === 'welcome') {
+      h = '<header class="masthead"><p class="eyebrow">Guided workouts</p><h1>Workouts built around you</h1></header>' +
+        '<p class="lead">Answer five short questions. The app builds your week from a library of ' + CATALOGUE.filter(x => x.f).length + ' animated exercises, guides you through each session with a moving figure and a timer, and keeps a record of every set.</p>' +
+        '<div class="stagebox"><svg id="obSvg" aria-hidden="true"></svg></div>' +
+        '<div class="btnrow" style="flex-direction:column"><button type="button" class="btn-start" data-act="obNext">Build my plan</button>' +
+        '<button type="button" class="btn" data-act="obP12">Use the ready-made 12-week plan instead</button></div>' +
+        '<p class="foot">The 12-week plan is a gentle, low-impact programme: three sessions a week with resistance bands and a chair.</p>';
+    } else if (st === 'goal') {
+      h = '<h1>What do you want from your workouts?</h1><div class="opts">' + GOALS.map(g => '<button type="button" class="opt' + (P.goal === g[0] ? ' on' : '') + '" data-act="obSet" data-k="goal" data-v="' + g[0] + '" aria-pressed="' + (P.goal === g[0]) + '"><b>' + g[1] + '</b><span>' + g[2] + '</span></button>').join('') + '</div>';
+    } else if (st === 'level') {
+      h = '<h1>How experienced are you?</h1><div class="opts">' + LEVELS.map((l, i) => '<button type="button" class="opt' + (P.level === i ? ' on' : '') + '" data-act="obSet" data-k="level" data-v="' + i + '" aria-pressed="' + (P.level === i) + '"><b>' + l[0] + '</b><span>' + l[1] + '</span></button>').join('') + '</div>' +
+        '<button type="button" class="check' + (P.lowImpact ? ' on' : '') + '" data-act="obLow" aria-pressed="' + !!P.lowImpact + '"><i></i><span>Keep it low-impact<small>No jumping or running. Kinder to knees, ankles and feet.</small></span></button>';
+    } else if (st === 'equip') {
+      h = '<h1>What equipment can you use?</h1><p class="muted">Tick everything you have. Leave it all empty for bodyweight-only workouts. A chair, a wall and a table are assumed.</p>' +
+        '<div class="chips"><button type="button" class="chip" data-act="obPreset" data-v="none">Nothing</button><button type="button" class="chip" data-act="obPreset" data-v="home">Home basics</button><button type="button" class="chip" data-act="obPreset" data-v="gym">Full gym</button></div>' +
+        '<div class="eqgrid">' + EQUIP.map(e => { const on = P.equip.indexOf(e[0]) >= 0; return '<button type="button" class="eq' + (on ? ' on' : '') + '" data-act="obEq" data-v="' + e[0] + '" aria-pressed="' + on + '"><i></i>' + e[1] + '</button>'; }).join('') + '</div>';
+    } else if (st === 'time') {
+      h = '<h1>How much time do you have?</h1>' +
+        '<div class="field"><span class="lab">Workouts a week</span><div class="seg">' + [2, 3, 4, 5, 6].map(n => '<button type="button" class="' + (P.days === n ? 'on' : '') + '" data-act="obSet" data-k="days" data-v="' + n + '" aria-pressed="' + (P.days === n) + '">' + n + '</button>').join('') + '</div></div>' +
+        '<div class="field"><span class="lab">Minutes per workout</span><div class="seg">' + MINUTES.map(n => '<button type="button" class="' + (P.minutes === n ? 'on' : '') + '" data-act="obSet" data-k="minutes" data-v="' + n + '" aria-pressed="' + (P.minutes === n) + '">' + n + '</button>').join('') + '</div></div>' +
+        '<p class="muted">The time includes a warm-up and a cool-down.</p>';
+      next = 'Build my plan';
+    } else {
+      if (!o.plan) o.plan = buildPlan(P, S.seedN);
+      h = '<h1>Your week</h1><p class="muted">' + esc(GOAL_NAME[P.goal]) + ' · ' + LEVELS[P.level][0] + ' · ' + P.days + ' workouts of about ' + P.minutes + ' min</p>' +
+        o.plan.workouts.map(w => { const t = sessionTotals(buildSteps(w, ctx())); return '<div class="wcard"><div class="hd"><h3>' + esc(w.name) + '</h3><time>' + Math.round(t.total / 60) + ' min</time></div><p>' + esc(w.tag) + '</p><p class="names">' + w.main.map(it => esc(EX[it.x].n)).join(' · ') + '</p></div>'; }).join('') +
+        '<button type="button" class="btn" data-act="obShuffle">Shuffle the exercises</button><p class="foot">You can swap any exercise later.</p>';
+      next = 'Start with this plan';
+    }
+    v.className = 'wrap ob';
+    v.innerHTML = prog + h + (st === 'welcome' ? '' : '<div class="ob-foot"><button type="button" class="btn" data-act="obBack">' + (o.step <= 1 && o.redo ? 'Cancel' : 'Back') + '</button><button type="button" class="btn solid" data-act="obNext"' + (canNext ? '' : ' disabled') + '>' + next + '</button></div>');
+    if (st === 'welcome') { obStage = new Stage($('obSvg')); }
+  }
+  let obStage = null;
+  const OB_DEMO = ['Bodyweight_Squat', 'Pushups', 'x_band_row', 'Dumbbell_Shoulder_Press', 'Dead_Bug'].filter(id => EX[id]);
+
+  /* =========================== TODAY =========================== */
+  let hero = { list: [], i: 0, t0: 0, stage: null };
+  function rowMeta(it) {
+    const last = lastOf(S.log, it.x); if (!last) return '';
+    const timed = itemTimed(it), w = lastWeight(last), vals = last.sets.map(s => (timed ? s.s : s.r)).filter(v => v != null);
+    return (readyToProgress(it, last) ? '<em>Ready to go up</em> · ' : '') + 'Last: ' + vals.join(', ') + (timed ? ' sec' : '') + (w != null ? ' × ' + wShow(w) + ' ' + unit() : '');
+  }
+  function itemRow(it, block, i) {
+    const x = EX[it.x];
+    return '<li class="move"><button type="button" class="thumb" data-act="item" data-b="' + block + '" data-i="' + i + '" aria-label="Show ' + esc(x.n) + '"><svg data-th="' + esc(x.id) + '"></svg></button>' +
+      '<div class="mid"><h3><button type="button" data-act="item" data-b="' + block + '" data-i="' + i + '">' + esc(it.title || x.n) + '</button></h3><p class="rx"><b>' + rxText(it) + '</b>' + esc(it.note || '') + '</p>' + (block === 'main' && rowMeta(it) ? '<p class="rx">' + rowMeta(it) + '</p>' : '') + '</div>' +
+      (isP12() ? '' : '<button type="button" class="iconbtn" data-act="swap" data-b="' + block + '" data-i="' + i + '" aria-label="Swap ' + esc(x.n) + '"><svg viewBox="0 0 24 24"><path d="M4 8h13l-3-3M20 16H7l3 3"/></svg></button>') + '</li>';
+  }
+  function miniRows(list, block) {
+    return list.map((it, i) => { const x = EX[it.x]; return '<li><button type="button" class="thumb" data-act="item" data-b="' + block + '" data-i="' + i + '" aria-label="Show ' + esc(x.n) + '"><svg data-th="' + esc(x.id) + '"></svg></button><div><b>' + esc(it.title || x.n) + '</b><span>' + esc(it.sub || musText(x)) + '</span></div><time>' + rxText(it) + '</time></li>'; }).join('');
+  }
+  function renderToday() {
+    const ws = workouts(), w = curW(), idx = curIdx(), steps = buildSteps(w, ctx()), t = sessionTotals(steps), P = profile();
+    const d = new Date(), r = readRun();
+    let label;
+    if (isP12()) { const dn = weekDone12(S.plan.week); label = 'Week ' + S.plan.week + ' · ' + (dn >= 3 ? 'all 3 sessions done' : 'session ' + (dn + 1) + ' of 3'); }
+    else label = weekCount(S.log, Date.now()) + ' of ' + P.days + ' done this week';
+    let h = '<header class="masthead"><p class="eyebrow">' + d.toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long' }) + '</p><h1>Today</h1></header>';
+    if (r) h += '<div class="callout"><p>Workout in progress: ' + esc(r.name) + '.</p><button type="button" class="btn solid" data-act="resume">Resume</button><button type="button" class="btn" data-act="discard">Discard</button></div>';
+    if (isP12() && weekDone12(S.plan.week) >= 3 && S.plan.week < 12) h += '<div class="callout warm"><p>Week ' + S.plan.week + ' is complete.</p><button type="button" class="btn solid" data-act="nextweek">Go to week ' + (S.plan.week + 1) + '</button></div>';
+    h += '<section class="today"><div class="stagebox"><svg id="heroSvg" aria-hidden="true"></svg><span class="stage-cap" id="heroCap"></span></div><div class="today-body"><p class="eyebrow">' + esc(label) + '</p><h2 class="wname">' + esc(w.name) + '</h2><p class="muted">' + esc(w.tag) + '</p>' +
+      '<p class="today-time"><span>' + Math.round(t.total / 60) + '</span><small>min</small></p><p class="today-split">Warm-up ' + Math.round(t.warm / 60) + ' · Main work ' + Math.round(t.main / 60) + ' · Cool-down ' + Math.round(t.cool / 60) + ' min · ' + t.sets + ' sets</p>' +
+      '<button type="button" class="btn-start" data-act="start">Start workout</button></div></section>';
+    if (ws.length > 1) h += '<div class="chips scroll" role="group" aria-label="Choose a workout">' + ws.map((x, i) => '<button type="button" class="wchip' + (i === idx ? ' on' : '') + (i === S.next % ws.length ? ' next' : '') + '" data-act="pick" data-i="' + i + '" aria-pressed="' + (i === idx) + '"><b>' + esc(x.name) + '</b><small>' + (i === S.next % ws.length ? 'Up next' : esc(x.tag.split(',')[0])) + '</small></button>').join('') + '</div>';
+    h += '<section><h2>Main work <small>' + w.main.length + ' exercises</small></h2><ul class="moves">' + w.main.map((it, i) => itemRow(it, 'main', i)).join('') + '</ul></section>';
+    h += '<section class="two"><div><h2>Warm-up <small>' + Math.round(t.warm / 60) + ' min</small></h2><ul class="mini">' + miniRows(w.warm, 'warm') + '</ul></div>' + (w.cool.length ? '<div><h2>Cool-down <small>' + Math.round(t.cool / 60) + ' min</small></h2><ul class="mini">' + miniRows(w.cool, 'cool') + '</ul></div>' : '') + '</section>';
+    if (installEvt && !standalone()) h += '<div class="callout warm"><p>Install this app on your phone so it opens full-screen and works offline.</p><button type="button" class="btn solid" data-act="install">Install</button></div>';
+    $('view').innerHTML = h;
+    hero.list = w.main.map(it => ({ it, x: EX[it.x] })); hero.i = 0; hero.t0 = performance.now(); hero.stage = new Stage($('heroSvg'));
+    heroShow();
+  }
+  function heroShow() {
+    const m = hero.list[hero.i]; if (!m) return;
+    $('heroCap').textContent = m.it.title || m.x.n;
+    hero.anim = animOf(m.x, m.it.o); hero.tl = timelineOf(m.x, m.it.tempo, 0, m.it.o); hero.loop = loopOf(m.x, m.it.o);
+    if (reduceMotion) { hero.stage.set(hero.anim[0], hero.anim[1]); hero.stage.draw(0.8, 0.3); } else drawDemo(hero.stage, hero.anim, hero.tl, 0, hero.loop);
+  }
+  function heroDraw(now) {
+    if (reduceMotion || !hero.list.length || !hero.stage || !document.getElementById('heroSvg')) return;
+    const el = (now - hero.t0) / 1000, span = hero.tl ? cycleOf(hero.tl) * 2 : 5;
+    if (el >= span) { hero.i = (hero.i + 1) % hero.list.length; hero.t0 = now; heroShow(); return; }
+    drawDemo(hero.stage, hero.anim, hero.tl, el, hero.loop);
+  }
+
+  /* =========================== PLAN =========================== */
+  function renderPlan() {
+    let h = '<header class="masthead"><p class="eyebrow">' + (isP12() ? '12-week plan · Mon / Wed / Fri' : 'Your plan') + '</p><h1>Plan</h1></header>';
+    if (isP12()) {
+      const pl = S.plan, p = phaseOf(pl.week), P = PHASES[p - 1], range = P.rest[0] !== P.rest[1], rest = p12Rest(p, pl);
+      h += '<section><div class="phase-tabs" role="group" aria-label="Phase">' + PHASES.map(q => '<button type="button" class="ptab' + (q.n === p ? ' on' : '') + '" data-act="phase" data-n="' + q.n + '" aria-pressed="' + (q.n === p) + '"><small>Weeks</small><b>' + q.tab + '</b></button>').join('') + '</div><div class="week-row" role="group" aria-label="Week">';
+      for (let w = P.from; w <= P.to; w++) { const dn = Math.min(3, weekDone12(w)); h += '<button type="button" class="wk' + (w === pl.week ? ' on' : '') + '" data-act="week" data-w="' + w + '" aria-pressed="' + (w === pl.week) + '"><span>Week ' + w + '</span><i class="pips" role="img" aria-label="' + dn + ' of 3 sessions done">' + [0, 1, 2].map(i => '<u class="' + (i < dn ? 'f' : '') + '"></u>').join('') + '</i>' + (CHECKIN_WEEKS.indexOf(w) >= 0 ? '<em>Check-in</em>' : '') + '</button>'; }
+      h += '</div><p class="focus"><b>' + esc(P.scheme) + '.</b> ' + esc(P.focus) + '.</p></section>';
+      h += '<section><h2>Your choices</h2><div class="field"><span class="lab">Push-up version</span><div class="chips">' + Object.keys(P12.push.variants).map(k => '<button type="button" class="chip' + (k === p12PushVar(pl, p) ? ' on' : '') + '" data-act="p12var" data-v="' + k + '">' + P12.push.variants[k][0] + '</button>').join('') + '</div></div>' +
+        (p >= 3 ? '<div class="field"><span class="lab">Core exercise</span><div class="chips">' + [['deadbug', 'Dead bug'], ['plank', 'Plank']].map(c => '<button type="button" class="chip' + (c[0] === p12Core(pl, p) ? ' on' : '') + '" data-act="p12core" data-v="' + c[0] + '">' + c[1] + '</button>').join('') + '</div></div>' : '') + '</section>';
+      h += '<section><h2>Rules <small>weeks ' + P.tab + '</small></h2><dl class="rules"><div><dt>Effort</dt><dd>' + P.effort + ' left in the tank</dd><p>Stop each set while you could still do that many more reps.</p></div>' +
+        '<div><dt>Rest between sets</dt><dd>' + (range ? P.rest[0] + '–' + P.rest[1] : P.rest[0]) + ' sec</dd>' + (range ? '<div class="seg">' + [60, 75, 90].map(n => '<button type="button" class="' + (rest === n ? 'on' : '') + '" data-act="p12rest" data-n="' + n + '">' + n + '</button>').join('') + '</div>' : '<p>The rest timer counts it for you.</p>') + '</div>' +
+        '<div><dt>Tempo</dt><dd>' + P.tempo[0] + ' down / ' + P.tempo[1] + ' up</dd><p>Seconds. The figure and the beeps move at this pace.</p></div><div><dt>Band strength</dt><dd>' + P.band + '</dd><p>Add reps before you change bands.</p></div></dl></section>';
+      const items = ['<li><b>Walk every day:</b> ' + esc(P.walk) + '.</li>'];
+      if (p === 3) items.push('<li><b>One extra low-impact session</b> this week: bike or pool if you can.</li>');
+      if (CHECKIN_WEEKS.indexOf(pl.week) >= 0) items.push('<li><b>Check-in this week.</b> ' + esc(CHECKIN_TEXT) + '</li>');
+      P12_NOTES.forEach(n => items.push('<li><b>' + esc(n[0]) + '</b> ' + esc(n[1]) + '</li>'));
+      h += '<section><h2>Outside the sessions</h2><ul class="plain">' + items.join('') + '</ul></section>';
+      h += '<section><h2>How to progress</h2><ul class="ifthen">' + PROGRESS_RULES.map(r => '<li><i>If ' + esc(r[0].charAt(0).toLowerCase() + r[0].slice(1)) + '</i><b>' + esc(r[1]) + '</b></li>').join('') + '</ul></section>';
+      h += '<section><h2>Want something else?</h2><div class="btnrow">' + (S.saved ? '<button type="button" class="btn" data-act="useSaved">Back to my personal plan</button>' : '') + '<button type="button" class="btn" data-act="setup">Build a personal plan</button></div></section>';
+    } else {
+      const P = profile();
+      h += '<p class="lead">' + esc(GOAL_NAME[P.goal]) + ' · ' + LEVELS[P.level][0] + ' · ' + P.days + ' workouts a week, about ' + P.minutes + ' min each' + (P.lowImpact ? ' · low-impact' : '') + '</p><p class="muted">Equipment: ' + (P.equip.length ? P.equip.map(t => EQUIP_NAME[t]).join(', ') : 'none (bodyweight)') + '</p>';
+      h += '<section>' + workouts().map((w, i) => { const t = sessionTotals(buildSteps(w, ctx())); return '<button type="button" class="wcard" data-act="openW" data-i="' + i + '"><div class="hd"><h3>' + esc(w.name) + '</h3><time>' + Math.round(t.total / 60) + ' min</time></div><p>' + esc(w.tag) + (i === S.next % workouts().length ? ' · up next' : '') + '</p><p class="names">' + w.main.map(it => esc(EX[it.x].n)).join(' · ') + '</p></button>'; }).join('') + '</section>';
+      h += '<div class="btnrow"><button type="button" class="btn" data-act="shuffle">Shuffle the exercises</button><button type="button" class="btn" data-act="setup">Change my answers</button></div>';
+      h += '<section><h2>Ready-made plan</h2><p class="muted">A gentle 12-week programme: three sessions a week with resistance bands and a chair, getting harder in four stages. Your personal plan is kept, so you can come back to it.</p><button type="button" class="btn" data-act="useP12">Switch to the 12-week plan</button></section>';
+    }
+    $('view').innerHTML = h;
+  }
+
+  /* =========================== HISTORY =========================== */
+  function setsText(q) {
+    const d = q.sets.filter(s => s && s.d); if (!d.length) return 'skipped';
+    const timed = d[0].s != null && d[0].r == null, w = d.map(s => s.w).filter(v => v != null), same = w.length && w.every(v => v === w[0]);
+    if (w.length && !same) return d.map(s => (timed ? s.s + ' s' : s.r) + (s.w != null ? '×' + wShow(s.w) : '')).join(', ') + ' ' + unit();
+    return d.map(s => (timed ? s.s : s.r)).join(', ') + (timed ? ' sec' : '') + (same ? ' × ' + wShow(w[0]) + ' ' + unit() : '');
+  }
+  function renderHistory() {
+    const now = Date.now(), P = profile(), goal = isP12() ? 3 : P.days, tot = S.log.reduce((s, e) => s + (e.dur || 0), 0);
+    let h = '<header class="masthead"><p class="eyebrow">Everything you have done</p><h1>History</h1></header>';
+    h += '<div class="statrow"><div><b>' + S.log.length + '</b><span>workouts</span></div><div><b>' + weekCount(S.log, now) + '/' + goal + '</b><span>this week</span></div><div><b>' + weekStreak(S.log, goal, now) + '</b><span>weeks on target in a row</span></div><div><b>' + (tot >= 36000 ? Math.round(tot / 3600) : (tot / 3600).toFixed(1)) + '</b><span>hours trained</span></div></div>';
+    const start = weekStart(now) - 4 * 7 * DAY, days = {}; S.log.forEach(e => { const d = new Date(e.t); d.setHours(0, 0, 0, 0); days[d.getTime()] = 1; });
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    h += '<section><h2>Last five weeks</h2><div class="cal">' + ['M', 'T', 'W', 'T', 'F', 'S', 'S'].map(c => '<span>' + c + '</span>').join('');
+    for (let i = 0; i < 35; i++) { const d = new Date(start); d.setDate(d.getDate() + i); const k = d.getTime(); h += '<i class="' + (days[k] ? 'f' : '') + (k === today.getTime() ? ' t' : '') + (k > today.getTime() ? ' o' : '') + '">' + d.getDate() + '</i>'; }
+    h += '</div></section><section><h2>Workouts</h2>';
+    if (!S.log.length) h += '<p class="empty">Nothing yet. Finished workouts are listed here with every set you did.</p>';
+    else h += '<ul class="rows">' + S.log.slice(-60).reverse().map(e => '<li><button type="button" class="rowbtn" data-act="sess" data-id="' + e.t + '"><span><b>' + esc(e.name) + '</b><small>' + new Date(e.t).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' }) + ' · ' + sessionSets(e) + ' sets' + (sessionVolume(e) ? ' · ' + Math.round(sessionVolume(e) * (unit() === 'lb' ? LB : 1)).toLocaleString() + ' ' + unit() + ' lifted' : '') + '</small></span><span>' + Math.max(1, Math.round((e.dur || 0) / 60)) + ' min</span></button></li>').join('') + '</ul>';
+    h += '</section>';
+    const seen = {}, exs = []; for (let i = S.log.length - 1; i >= 0; i--) S.log[i].ex.forEach(q => { if (!seen[q.x] && EX[q.x] && q.sets.some(s => s && s.d)) { seen[q.x] = 1; exs.push(q.x); } });
+    if (exs.length) h += '<section><h2>Your exercises</h2><ul class="rows">' + exs.slice(0, 80).map(id => { const r = recordsOf(S.log, id); return '<li><button type="button" class="rowbtn" data-act="ex" data-id="' + esc(id) + '"><span><b>' + esc(EX[id].n) + '</b><small>' + r.n + (r.n === 1 ? ' session' : ' sessions') + '</small></span><span>' + (r.bestW != null ? wShow(r.bestW) + ' ' + unit() : r.bestR != null ? r.bestR + ' reps' : r.bestS + ' sec') + '</span></button></li>'; }).join('') + '</ul></section>';
+    $('view').innerHTML = h;
+  }
+
+  /* =========================== LIBRARY =========================== */
+  const AREAS = ['All', 'Legs', 'Chest', 'Back', 'Shoulders', 'Arms', 'Core', 'Cardio', 'Stretch'];
+  function libList() {
+    const L = UI.lib, q = L.q.trim().toLowerCase().split(/\s+/).filter(Boolean), have = haveSet(profile());
+    return CATALOGUE.filter(x => {
+      if (L.area === 'Cardio') { if (x.s !== 'cardio' && x.s !== 'plyo') return false; }
+      else if (L.area === 'Stretch') { if (x.c !== 'stretching') return false; }
+      else if (L.area !== 'All' && (MUSCLE_AREA[x.m[0]] !== L.area || x.c === 'stretching')) return false;
+      if (L.mine && !(x.nd || []).every(t => have[t])) return false;
+      if (q.length) { const hay = (x.n + ' ' + (x.a || '') + ' ' + x.m.join(' ') + ' ' + equipText(x)).toLowerCase(); if (!q.every(w => hay.indexOf(w) >= 0)) return false; }
+      return true;
+    }).sort((a, b) => (b.f ? 1 : 0) - (a.f ? 1 : 0) || b.p - a.p || (a.n < b.n ? -1 : 1));
+  }
+  function libRows() {
+    const list = libList(), L = UI.lib;
+    return '<p class="muted small">' + list.length + ' exercises</p>' + (list.length ? '<ul class="lib">' + list.slice(0, L.n).map(x => '<li><button type="button" class="libbtn" data-act="ex" data-id="' + esc(x.id) + '">' + thumbHtml(x) + '<span><b>' + esc(x.n) + '</b><small>' + esc(musText(x)) + ' · ' + esc(equipText(x)) + '</small>' + (!x.f ? '<i class="tagline">No animation</i>' : x.ax ? '<i class="tagline">Similar movement shown</i>' : '') + '</span></button></li>').join('') + '</ul>' : '<p class="empty">Nothing matches. Try a shorter search.</p>') +
+      (list.length > L.n ? '<button type="button" class="btn" data-act="libMore">Show more</button>' : '');
+  }
+  function renderLibrary() {
+    const L = UI.lib;
+    $('view').innerHTML = '<header class="masthead"><p class="eyebrow">' + CATALOGUE.length + ' exercises · ' + CATALOGUE.filter(x => x.f).length + ' animated</p><h1>Library</h1></header>' +
+      '<input class="search" id="libQ" type="search" placeholder="Search by name, muscle or equipment" value="' + esc(L.q) + '" aria-label="Search exercises">' +
+      '<div class="chips scroll">' + AREAS.map(a => '<button type="button" class="chip' + (L.area === a ? ' on' : '') + '" data-act="libArea" data-v="' + a + '">' + a + '</button>').join('') + '<button type="button" class="chip' + (L.mine ? ' on' : '') + '" data-act="libMine">My equipment</button></div><div id="libOut">' + libRows() + '</div>';
+  }
+  function libRefresh() { const o = $('libOut'); if (o) { o.innerHTML = libRows(); paintThumbs(o); } }
+
+  /* =========================== SETTINGS =========================== */
+  const standalone = () => (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) || window.navigator.standalone === true;
+  let installEvt = null;
+  window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installEvt = e; if (UI.tab === 'today' || UI.tab === 'settings') render(); });
+  window.addEventListener('appinstalled', () => { installEvt = null; toast('Installed. Look for the icon on your home screen.'); render(); });
+  function seg(key, opts) { return '<div class="seg">' + opts.map(o => '<button type="button" class="' + (String(S.settings[key]) === String(o[0]) ? 'on' : '') + '" data-act="set" data-k="' + key + '" data-v="' + o[0] + '" aria-pressed="' + (String(S.settings[key]) === String(o[0])) + '">' + o[1] + '</button>').join('') + '</div>'; }
+  function renderSettings() {
+    const n = CATALOGUE.length, an = CATALOGUE.filter(x => x.f).length, ax = CATALOGUE.filter(x => x.ax).length;
+    $('view').innerHTML = '<header class="masthead"><p class="eyebrow">Guided Workouts ' + VERSION + '</p><h1>Settings</h1></header><div>' +
+      '<div class="set"><h3>Sound</h3>' + seg('sound', (Snd.canSpeak ? [['voice', 'Voice + beeps']] : []).concat([['beeps', 'Beeps'], ['off', 'Off']])) + '</div>' +
+      '<div class="set"><h3>Set pacing</h3>' + seg('pace', [['guided', 'Guided'], ['own', 'My own pace']]) + '<p>Guided counts each rep at a steady tempo and moves on by itself. With your own pace, the figure keeps demonstrating and you tap Done when the set is finished.</p></div>' +
+      '<div class="set"><h3>Rest between sets</h3>' + seg('restAdj', [[-15, '15 s less'], [0, 'As planned'], [15, '15 s more'], [30, '30 s more']]) + '</div>' +
+      '<div class="set"><h3>Weight unit</h3>' + seg('units', [['kg', 'kg'], ['lb', 'lb']]) + '</div>' +
+      '<div class="set"><h3>Appearance</h3>' + seg('theme', [['auto', 'Match phone'], ['light', 'Light'], ['dark', 'Dark']]) + '</div>' +
+      '<div class="set"><h3>Install on this phone</h3>' + (standalone() ? '<p>Installed. You are using the app version.</p>' : installEvt ? '<button type="button" class="btn solid" data-act="install">Install app</button>' : '<p>In Chrome on Android, open the ⋮ menu and choose “Add to Home screen” or “Install app”. On iPhone, use Share, then “Add to Home Screen”.</p>') + '</div>' +
+      '<div class="set"><h3>Backup</h3><p>' + (cloudOn ? 'Your plan and history are saved with this page.' : storageOK ? 'Your plan and history are stored on this device only. Save a backup file now and then, or before changing phones.' : 'This browser is not letting the app save anything, so it starts fresh each time. Install the app or use a normal browser window.') + '</p><div class="btnrow"><button type="button" class="btn" data-act="export">Save a backup file</button><button type="button" class="btn" data-act="import">Restore from a backup</button></div></div>' +
+      '<div class="set"><h3>Start over</h3><div class="btnrow"><button type="button" class="btn" data-act="setup">Change my answers</button><button type="button" class="btn warn" data-act="erase">' + (eraseArmed ? 'Tap again to erase everything' : 'Erase everything') + '</button></div></div>' +
+      '<div class="set"><h3>About</h3><p>' + n + ' exercises, ' + an + ' with an animated demonstration (' + ax + ' of those show a similar movement). The exercise list (names, muscles, equipment, level) comes from the open free-exercise-db project. Every animation is drawn by this app and the form cues were written for it. Fonts: Barlow and Big Shoulders Display, SIL Open Font License.</p><p>This app gives general exercise guidance, not medical advice. Stop if something hurts.</p></div></div>';
+  }
+  let eraseArmed = 0;
+
+  /* =========================== SHEETS =========================== */
+  let sheet = { stage: null, cfg: null, t0: 0, last: '', open: false };
+  function openSheet(cfg) {
+    sheet.cfg = cfg; sheet.t0 = performance.now(); sheet.last = '';
+    $('sheetTitle').textContent = cfg.title; $('sheetDoc').textContent = cfg.doc || '';
+    $('sheetStageBox').hidden = !cfg.anim; $('sheetCap').textContent = '';
+    $('sheetBody').innerHTML = cfg.body || '';
+    paintThumbs($('sheetBody'));
+    if (!sheet.open) { sheet.open = true; $('sheet').hidden = false; document.documentElement.classList.add('locked'); Nav.open(() => { sheet.open = false; sheet.cfg = null; $('sheet').hidden = true; if (!playing) document.documentElement.classList.remove('locked'); }); }
+    $('sheet').firstElementChild.scrollTop = 0;
+    if (cfg.anim) drawDemo(sheet.stage, cfg.anim, cfg.tl, 0, cfg.loop);
+  }
+  const closeSheet = () => { if (sheet.open) Nav.close(); };
+  function sheetDraw(now) { const c = sheet.cfg; if (!c || !c.anim) return; const p = drawDemo(sheet.stage, c.anim, c.tl, (now - sheet.t0) / 1000, c.loop), l = p ? p.l : ''; if (l !== sheet.last) { sheet.last = l; $('sheetCap').textContent = l; } }
+  function exBody(x, extra) {
+    const cues = x.f ? cuesOf(x, extra) : null, r = recordsOf(S.log, x.id);
+    let h = '';
+    if (!x.f) h += '<p class="notice">There is no animation for this exercise yet, so it cannot be used in guided workouts.</p>';
+    else if (x.ax) h += '<p class="notice">The figure shows a similar movement, not this exact exercise.</p>';
+    if (cues) h += '<ul class="cues">' + [['Set up', cues[0]], ['Move', cues[1]], ['Watch', cues[2]]].map(c => '<li><i>' + c[0] + '</i><span>' + esc(c[1]) + '</span></li>').join('') + '</ul>';
+    if (x.m2 && x.m2.length) h += '<p class="muted small">Also works: ' + esc(x.m2.join(', ')) + '</p>';
+    if (r.n) {
+      h += '<div class="sheet-rx"><span><b>' + r.n + '</b>' + (r.n === 1 ? 'session' : 'sessions') + '</span>' + (r.bestW != null ? '<span><b>' + wShow(r.bestW) + ' ' + unit() + '</b>best' + (r.bestWr ? ' × ' + r.bestWr : '') + '</span>' : r.bestR != null ? '<span><b>' + r.bestR + '</b>best reps</span>' : '<span><b>' + r.bestS + ' s</b>longest</span>') + '</div>';
+      if (r.hist.length > 1) { const hs = r.hist.slice(-20), mx = Math.max.apply(null, hs.map(p => p.v)), mn = Math.min.apply(null, hs.map(p => p.v)), pts = hs.map((p, i) => [8 + i * (284 / (hs.length - 1)), 56 - (mx === mn ? 24 : (p.v - mn) / (mx - mn) * 48)]); h += '<svg class="spark" viewBox="0 0 300 64" role="img" aria-label="Progress over your last sessions"><path d="M' + pts.map(p => p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join(' L') + '"/><circle cx="' + pts[pts.length - 1][0].toFixed(1) + '" cy="' + pts[pts.length - 1][1].toFixed(1) + '" r="4"/></svg>'; }
+      h += '<ul class="setlist">' + r.hist.slice(-5).reverse().map(p => '<li><span>' + new Date(p.t).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }) + '</span><span>' + esc(setsText({ sets: p.sets })) + '</span></li>').join('') + '</ul>';
+    }
+    return h;
+  }
+  function exCfg(x, extra, it) { return { title: (it && it.title) || x.n, doc: musText(x) + ' · ' + equipText(x) + ' · ' + LEVEL_NAME[x.lv], anim: x.f ? animOf(x, extra) : null, tl: x.f ? timelineOf(x, it && it.tempo, 0, extra) : null, loop: x.f ? loopOf(x, extra) : 3 }; }
+  function openExercise(id) {
+    const x = EX[id]; if (!x) return; const c = exCfg(x);
+    c.body = exBody(x) + (x.f && !isP12() && S.plan ? '<div class="field"><span class="lab">Add to a workout</span><div class="chips">' + workouts().map((w, i) => '<button type="button" class="chip" data-act="addTo" data-i="' + i + '" data-id="' + esc(id) + '">' + esc(w.name) + '</button>').join('') + '</div></div>' : '');
+    openSheet(c);
+  }
+  function openItem(block, i) {
+    const w = curW(), it = w[block][i]; if (!it) return; const x = EX[it.x], c = exCfg(x, it.o, it);
+    let h = '<div class="sheet-rx"><span><b>' + rxText(it) + '</b></span>' + (it.rest && block === 'main' ? '<span><b>' + it.rest + ' s</b>rest</span>' : '') + '</div>';
+    if (!isP12()) {
+      if (block === 'main') h += '<div class="editrow"><span>Sets</span><div class="num"><button type="button" data-act="sets" data-d="-1" data-i="' + i + '"' + ((it.sets || 1) <= 1 ? ' disabled' : '') + ' aria-label="Fewer sets">−</button><output>' + (it.sets || 1) + '</output><button type="button" data-act="sets" data-d="1" data-i="' + i + '"' + ((it.sets || 1) >= 6 ? ' disabled' : '') + ' aria-label="More sets">+</button></div></div>';
+      h += '<div class="btnrow"><button type="button" class="btn" data-act="swap" data-b="' + block + '" data-i="' + i + '">Swap for another exercise</button>' + (w[block].length > (block === 'main' ? 2 : 1) ? '<button type="button" class="btn" data-act="remove" data-b="' + block + '" data-i="' + i + '">Remove</button>' : '') + '</div>';
+    }
+    c.body = h + exBody(x, it.o); openSheet(c);
+  }
+  let swapCtx = null;
+  function openSwap(block, i, all) {
+    const w = curW(), it = w[block][i]; if (!it) return; swapCtx = { block, i, all: !!all };
+    const alts = alternatives(it.x, profile(), 40, all);
+    openSheet({ title: 'Swap ' + EX[it.x].n, doc: 'Exercises that do the same job' + (all ? ', with any equipment' : ' with your equipment'), anim: null,
+      body: '<button type="button" class="chip' + (all ? ' on' : '') + '" data-act="swapAll" style="align-self:flex-start">Show all equipment</button>' + (alts.length ? '<ul class="picklist">' + alts.map(x => '<li><button type="button" class="libbtn" data-act="swapTo" data-id="' + esc(x.id) + '" style="border-top:0">' + thumbHtml(x) + '<span><b>' + esc(x.n) + '</b><small>' + esc(equipText(x)) + ' · ' + LEVEL_NAME[x.lv] + '</small>' + (x.ax ? '<i class="tagline">Similar movement shown</i>' : '') + '</span></button></li>').join('') + '</ul>' : '<p class="empty">No other exercise fits your equipment.</p>') });
+  }
+  function openSession(t) {
+    const e = S.log.find(z => z.t === t); if (!e) return;
+    openSheet({ title: e.name, doc: new Date(e.t).toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }) + ' · ' + Math.max(1, Math.round((e.dur || 0) / 60)) + ' min', anim: null,
+      body: '<ul class="setlist">' + e.ex.map(q => '<li><span>' + esc(q.n || (EX[q.x] && EX[q.x].n) || q.x) + '</span><span>' + esc(setsText(q)) + '</span></li>').join('') + '</ul><button type="button" class="btn warn" data-act="delSess" data-id="' + e.t + '">Delete this workout</button>' });
+  }
+
+  /* =========================== PLAYER =========================== */
+  let playing = false, run = null, pStage = null, wake = null, shown = {}, leaving = false;
+  const cur = () => run.steps[run.i];
+  const isGap = st => st.kind === 'ready' || st.kind === 'rest';
+  const setText = (id, v) => { v = String(v); if (shown[id] !== v) { shown[id] = v; $(id).textContent = v; } };
+  let memRun = null;
+  const sigOf = w => JSON.stringify([w.name, w.warm.map(i => i.x), w.main.map(i => [i.x, i.sets]), w.cool.map(i => i.x)]);
+  function readRun() {
+    let r = null; try { r = JSON.parse(localStorage.getItem(RUN_KEY) || 'null'); } catch (e) { }
+    if (!r) r = memRun;
+    if (!r || typeof r.i !== 'number' || Date.now() - r.at > 3600000) return null;
+    const w = workouts()[r.wi]; return w && sigOf(w) === r.sig ? r : null;
+  }
+  function saveRun() { memRun = { wi: run.wi, sig: run.sig, name: run.w.name, i: run.i, at: Date.now(), active: Math.round(run.active), ex: run.ex }; try { localStorage.setItem(RUN_KEY, JSON.stringify(memRun)); } catch (e) { } }
+  function clearRun() { memRun = null; try { localStorage.removeItem(RUN_KEY); } catch (e) { } }
+  async function wakeOn() { try { if (!('wakeLock' in navigator) || wake) return; wake = await navigator.wakeLock.request('screen'); wake.addEventListener('release', () => { wake = null; }); $('pNote').textContent = ''; } catch (e) { wake = null; $('pNote').textContent = 'Your screen may dim during long holds.'; } }
+  function wakeOff() { try { if (wake) wake.release(); } catch (e) { } wake = null; }
+
+  function startSession(resume) {
+    Snd.unlock();
+    const wi = resume ? resume.wi : curIdx(), w = workouts()[wi], steps = buildSteps(w, ctx());
+    run = { wi, w, sig: sigOf(w), steps, i: resume ? clamp(resume.i, 0, steps.length - 1) : 0, t: 0, paused: false, done: false, last: performance.now(), active: resume ? (+resume.active || 0) : 0, prevSec: -1, prevKey: -1,
+      ex: resume && Array.isArray(resume.ex) ? resume.ex : w.main.map(it => ({ x: it.x, n: it.title || EX[it.x].n, sets: [] })), manual: S.settings.pace === 'own', part: null };
+    playing = true; shown = {}; leaving = false;
+    $('pLeave').hidden = true; $('pDone').hidden = true; $('player').hidden = false;
+    document.documentElement.classList.add('locked');
+    if (!('wakeLock' in navigator)) $('pNote').textContent = 'Your screen may dim during long holds.';
+    paintSound(); paintToggle();
+    Nav.open(playerBack);
+    enterStep(null); wakeOn();
+  }
+  function playerBack() {                                         // the phone's back button during a workout
+    if (run && !run.done && !leaving) { ACT.leave(); Nav.open(playerBack); return; }
+    closePlayer();
+  }
+  function closePlayer() { playing = false; Snd.hush(); wakeOff(); $('player').hidden = true; document.documentElement.classList.remove('locked'); run = null; UI.pick = null; render(); window.scrollTo(0, 0); }
+  const spoken = s => String(s || '').replace(/ · /g, '. ').replace(/→/g, 'to').replace(/–/g, ' to ');
+  function announce(st, prev) {
+    if (isGap(st)) {
+      const n = st.next; Snd.cue(st.kind);
+      if (st.switchSides) Snd.say('Switch sides');
+      else if (st.kind === 'rest' && !n.newMove) Snd.say('Rest. Next, set ' + n.setNo + ' of ' + n.sets + '.');
+      else Snd.say((st.kind === 'rest' ? 'Rest. ' : '') + 'Next, ' + n.title + '. ' + n.detail + '.');
+    } else { Snd.cue('go'); if (st.say && prev && !isGap(prev)) Snd.say(st.say); }
+  }
+  function enterStep(prev) { run.t = 0; run.prevSec = -1; run.prevKey = -1; saveRun(); paintStep(); announce(cur(), prev); }
+  function defWeight(ei, si) {
+    const E = run.ex[ei]; for (let k = si - 1; k >= 0; k--) if (E.sets[k] && E.sets[k].w != null) return E.sets[k].w;
+    return lastWeight(lastOf(S.log, E.x));
+  }
+  function recordSet(st, how) {
+    if (isGap(st) || st.block !== 'main') return;
+    let v;
+    if (st.kind === 'reps') v = (how === 'auto' || run.manual) ? (how === 'skip' ? 0 : st.reps) : Math.min(st.reps, Math.floor(run.t / cycleOf(st.tl) + 0.5));
+    else v = how === 'auto' ? st.dur : Math.floor(run.t);
+    if (how === 'skip') v = 0;
+    if (st.part < st.parts - 1) { run.part = v; return; }
+    if (st.parts > 1 && st.anim[1].mirror && run.part != null) v = Math.min(v, run.part);
+    run.part = null;
+    const si = st.setNo - 1, d = st.kind === 'reps' ? v >= 1 : v >= 3, old = run.ex[st.ei].sets[si];
+    run.ex[st.ei].sets[si] = { r: st.kind === 'reps' ? (d ? v : st.reps) : null, s: st.kind === 'reps' ? null : (d ? v : st.dur), w: st.weighted ? (old && old.w != null ? old.w : defWeight(st.ei, si)) : null, d: d ? 1 : 0 };
+  }
+  function advance(how) {
+    const st = cur(); recordSet(st, how);
+    if (run.i >= run.steps.length - 1) { finish(); return false; }
+    run.i++; enterStep(st); return true;
+  }
+  function buildEntry() {
+    const ex = run.ex.map(q => ({ x: q.x, n: q.n, sets: q.sets.map(s => s || { r: null, s: null, w: null, d: 0 }) })).filter(q => q.sets.length);
+    const e = { t: Date.now(), dur: Math.round(run.active), name: run.w.name, tag: run.w.tag, kind: isP12() ? 'p12' : 'custom', ex };
+    if (isP12()) e.week = S.plan.week;
+    return e;
+  }
+  function finish(partial) {
+    run.done = true;
+    if (!partial) { Snd.cue('done'); Snd.say('Workout complete. Well done.'); }
+    const e = buildEntry(), n = workouts().length;
+    S.log.push(e); if (!partial && !isP12()) S.next = (run.wi + 1) % n;
+    commit(); clearRun(); wakeOff();
+    const vol = sessionVolume(e);
+    $('doneEyebrow').textContent = run.w.name + (isP12() ? ' · ' + Math.min(3, weekDone12(S.plan.week)) + ' of 3 this week' : ' · ' + weekCount(S.log, Date.now()) + ' of ' + profile().days + ' this week');
+    $('doneStats').innerHTML = '<div><b>' + Math.max(1, Math.round(e.dur / 60)) + '</b><span>minutes</span></div><div><b>' + sessionSets(e) + '</b><span>sets</span></div>' + (vol ? '<div><b>' + Math.round(vol * (unit() === 'lb' ? LB : 1)).toLocaleString() + '</b><span>' + unit() + ' lifted</span></div>' : '<div><b>' + S.log.length + '</b><span>workouts so far</span></div>');
+    $('doneList').innerHTML = e.ex.map(q => '<li><span>' + esc(q.n) + '</span><span>' + esc(setsText(q)) + '</span></li>').join('');
+    const notes = [];
+    run.w.main.forEach(it => { if (readyToProgress(it, lastOf(S.log, it.x))) notes.push('<li><b>' + esc(EX[it.x].n) + ':</b> top of the range on every set. ' + (isWeighted(EX[it.x]) ? 'Go a little heavier next time.' : 'Try a harder version, a stronger band or one more set next time.') + '</li>'); });
+    if (isP12()) { const P = PHASES[phaseOf(S.plan.week) - 1]; notes.push('<li><b>Today\'s walking:</b> ' + esc(P.walk) + '.</li>'); if (CHECKIN_WEEKS.indexOf(S.plan.week) >= 0) notes.push('<li><b>Check-in week.</b> ' + esc(CHECKIN_TEXT) + '</li>'); }
+    $('doneNotes').innerHTML = notes.join('');
+    $('pLeave').hidden = true; $('pDone').hidden = false;
+  }
+  function fireCues(st) {
+    if (st.kind === 'reps' && !run.manual) {
+      const cyc = cycleOf(st.tl), rep = Math.min(st.reps - 1, Math.floor(run.t / cyc));
+      let x = run.t - rep * cyc, idx = st.tl.length - 1;
+      for (let i = 0; i < st.tl.length; i++) { if (x < st.tl[i].d) { idx = i; break; } x -= st.tl[i].d; }
+      const key = rep * 16 + idx;
+      if (key !== run.prevKey) { const newRep = Math.floor(run.prevKey / 16) !== rep || run.prevKey < 0; run.prevKey = key; Snd.cue(st.tl[idx].k); if (newRep) Snd.say(String(rep + 1)); }
+    } else if (st.kind !== 'reps') {
+      const sec = Math.ceil(st.dur - run.t);
+      if (sec !== run.prevSec) { run.prevSec = sec; if (sec <= 3 && sec >= 1) Snd.cue('tick'); else if (!isGap(st) && st.dur >= 60 && sec === Math.round(st.dur / 2)) Snd.say('Halfway'); }
+    }
+  }
+  function playerTick(now) {
+    const dt = Math.min(1.5, Math.max(0, (now - run.last) / 1000)); run.last = now;
+    if (!run.paused && !run.done) {
+      run.t += dt; run.active += dt;
+      let st = cur();
+      while (run.t >= st.dur && !(run.manual && st.kind === 'reps')) { const over = run.t - st.dur; if (!advance('auto')) return; run.t = Math.min(over, 0.5); st = cur(); }
+      fireCues(st);
+    }
+    paintFrame();
+  }
+  const BLOCK_NAME = { warm: 'Warm-up', main: 'Main work', cool: 'Cool-down' };
+  function paintLog(st) {
+    const ref = st.logRef, box = $('pLog'); $('player').dataset.log = ref ? '1' : '0';
+    if (!ref) { box.hidden = true; return; }
+    const E = run.ex[ref.ei], rec = E.sets[ref.si]; if (!rec) { box.hidden = true; $('player').dataset.log = '0'; return; }
+    box.hidden = false;
+    const timed = rec.r == null, it = run.w.main[ref.ei];
+    $('pLogLab').textContent = E.n + ' · set ' + (ref.si + 1) + (rec.d ? ' logged' : ' skipped');
+    $('pNumA').hidden = !rec.d; $('pLogMark').hidden = !!rec.d;
+    $('pLogVal').textContent = timed ? rec.s : rec.r; $('pLogUnit').textContent = timed ? 'sec' : perSide(EX[E.x]) ? 'reps each side' : 'reps';
+    const wOn = isWeighted(EX[E.x]) && rec.d; $('pNumW').hidden = !wOn;
+    if (wOn) { if (document.activeElement !== $('pLogW')) $('pLogW').value = rec.w == null ? '' : wShow(rec.w); $('pLogW').placeholder = '0'; $('pLogWUnit').textContent = unit(); }
+    void it;
+  }
+  function logAdjust(f, dir) {
+    const st = cur(), ref = st.logRef; if (!ref) return; const rec = run.ex[ref.ei].sets[ref.si]; if (!rec) return;
+    if (f === 'v') { if (rec.r != null) rec.r = clamp(rec.r + dir, 1, 200); else rec.s = clamp(rec.s + dir * 5, 5, 3600); }
+    else { const curV = rec.w == null ? 0 : +wShow(rec.w); rec.w = wStore(Math.max(0, curV + dir * wStep())); }
+    saveRun(); paintLog(st);
+  }
+  function paintStep() {
+    const st = cur(), gap = isGap(st), show = gap ? st.next : st, P = $('player');
+    P.dataset.mode = st.kind === 'rest' ? 'rest' : st.kind === 'ready' ? 'ready' : 'work';
+    setText('pTag', st.kind === 'rest' ? 'Rest' : st.kind === 'ready' ? (st.switchSides ? 'Switch sides' : 'Get ready') : st.block === 'warm' ? 'Warm-up' : st.block === 'cool' ? 'Cool-down' : 'Work');
+    setText('pKicker', (gap ? 'Next · ' : '') + (show.kicker || '') + (gap && show.detail ? (show.kicker ? ' · ' : '') + show.detail : ''));
+    setText('pTitle', show.title);
+    setText('pCue', gap ? (show.newMove ? show.setup + ' ' + show.move : show.cue) : st.cue);
+    setText('pBlock', BLOCK_NAME[st.block]);
+    setText('pStepNo', show.exNo ? 'Exercise ' + show.exNo + ' of ' + show.exCount : '');
+    const blocks = { warm: 0, main: 0, cool: 0 }; run.steps.forEach(s => { blocks[s.block] += s.dur; });
+    $('pBlocks').querySelectorAll('span').forEach(el => { el.style.flex = blocks[el.dataset.b] + ' 1 0'; el.hidden = !blocks[el.dataset.b]; });
+    $('pNext').hidden = !gap; $('pApprox').hidden = !show.approx;
+    let hint = '';
+    if (gap && show.block === 'main' && show.newMove) { const it = run.w.main[show.ei], last = lastOf(S.log, show.exId); if (last) { const w = lastWeight(last); hint = readyToProgress(it, last) ? 'Top of the range last time' + (show.weighted ? ': go a little heavier.' : ': make it a bit harder.') : 'Last time: ' + last.sets.map(s => (s.r != null ? s.r : s.s + ' s')).join(', ') + (w != null ? ' × ' + wShow(w) + ' ' + unit() : ''); } }
+    setText('pHint', hint);
+    paintLog(st);
+    const work = !gap; $('pSkip').className = work ? 'done' : ''; setText('pSkipText', work ? 'Done' : 'Skip');
+    pStage.set(show.anim[0], show.anim[1]);
+  }
+  function paintFrame() {
+    const st = cur(), gap = isGap(st), t = Math.min(run.t, st.dur);
+    let big, of, label, fill;
+    if (st.kind === 'reps' && run.manual) {
+      const p = drawDemo(pStage, st.anim, st.tl, run.t, st.loop);
+      big = st.reps; of = 'reps' + (st.both ? ' per side' : ''); label = p ? p.l : ''; fill = 0;
+    } else if (st.kind === 'reps') {
+      const cyc = cycleOf(st.tl), rep = Math.min(st.reps - 1, Math.floor(t / cyc));
+      let x = t - rep * cyc, p = st.tl[st.tl.length - 1], k = 1;
+      for (let i = 0; i < st.tl.length; i++) { if (x < st.tl[i].d) { p = st.tl[i]; k = x / p.d; break; } x -= st.tl[i].d; }
+      big = rep + 1; of = 'of ' + st.reps + (st.both ? ' per side' : ''); label = p.l; fill = k;
+      pStage.draw(lerp(p.a, p.b, easeIO(k)), p.side);
+    } else {
+      const left = Math.max(0, st.dur - t);
+      big = left >= 60 ? fmtClock(left) : Math.ceil(left); of = left >= 60 ? '' : 'sec';
+      label = st.kind === 'rest' ? 'Rest' : st.kind === 'ready' ? 'Ready' : st.verb; fill = st.dur ? t / st.dur : 1;
+      const d = gap ? st.next : st; drawDemo(pStage, d.anim, d.tl, t, d.loop);
+    }
+    setText('pBig', big); setText('pOf', of); setText('pPhase', run.paused ? 'Paused' : label);
+    $('pPhaseFill').style.width = (clamp(fill, 0, 1) * 100).toFixed(1) + '%';
+    let left = Math.max(0, st.dur - t); const done = { warm: 0, main: 0, cool: 0 }, tot = { warm: 0, main: 0, cool: 0 };
+    run.steps.forEach((s, j) => { tot[s.block] += s.dur; if (j < run.i) done[s.block] += s.dur; else if (j > run.i) left += s.dur; });
+    done[st.block] += t; setText('pLeft', fmtClock(left));
+    $('pBlocks').querySelectorAll('span').forEach(el => { const f = tot[el.dataset.b] ? done[el.dataset.b] / tot[el.dataset.b] : 0; el.firstElementChild.style.width = (clamp(f, 0, 1) * 100).toFixed(1) + '%'; });
+  }
+  const ICON_PAUSE = 'M7 5h3.5v14H7zM13.5 5H17v14h-3.5z', ICON_PLAY = 'M8 5v14l11-7z';
+  function paintToggle() { $('pToggleText').textContent = run && run.paused ? 'Resume' : 'Pause'; $('pToggleIcon').firstElementChild.setAttribute('d', run && run.paused ? ICON_PLAY : ICON_PAUSE); }
+  function paintSound() { $('pSound').textContent = S.settings.sound === 'voice' ? 'Voice + beeps' : S.settings.sound === 'beeps' ? 'Beeps only' : 'Sound off'; }
+  function pause() { if (!run || run.paused || run.done) return; run.paused = true; Snd.hush(); paintToggle(); }
+  function resume() { if (!run || !run.paused) return; run.paused = false; run.last = performance.now(); Snd.unlock(); wakeOn(); paintToggle(); }
+
+  /* =========================== RENDER + EVENTS =========================== */
+  function render() {
+    if (UI.ob || !S.plan) { if (!UI.ob) UI.ob = { step: 0, P: Object.assign({}, DEFAULT_PROFILE, S.profile || {}), plan: null, redo: false }; renderSetup(); return; }
+    $('app').classList.remove('bare'); $('tabs').hidden = false; $('view').className = 'wrap';
+    $('tabs').querySelectorAll('button').forEach(b => { const on = b.dataset.tab === UI.tab; b.classList.toggle('on', on); if (on) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current'); });
+    ({ today: renderToday, plan: renderPlan, history: renderHistory, library: renderLibrary, settings: renderSettings })[UI.tab]();
+    paintThumbs($('view'));
+  }
+  function mutW(fn) { const w = S.plan.workouts[curIdx()]; fn(w); commit(); clearRun(); }
+  const ACT = {
+    tab(el) { UI.tab = el.dataset.tab; if (UI.tab !== 'today') UI.pick = UI.pick; render(); window.scrollTo(0, 0); },
+    obNext() {
+      const o = UI.ob;
+      if (OB_STEPS[o.step] === 'preview') { S.profile = o.P; S.plan = o.plan; S.plan.created = Date.now(); S.saved = null; S.next = 0; S.seedN++; UI.ob = null; UI.tab = 'today'; UI.pick = null; commit(); clearRun(); render(); window.scrollTo(0, 0); return; }
+      o.step++; o.plan = null; render(); window.scrollTo(0, 0);
+    },
+    obBack() { const o = UI.ob; if (o.step <= 1 && o.redo) { UI.ob = null; render(); return; } o.step = Math.max(0, o.step - 1); render(); window.scrollTo(0, 0); },
+    obSet(el) { const k = el.dataset.k; UI.ob.P[k] = k === 'goal' ? el.dataset.v : +el.dataset.v; render(); },
+    obLow() { UI.ob.P.lowImpact = !UI.ob.P.lowImpact; render(); },
+    obEq(el) { const e = UI.ob.P.equip, i = e.indexOf(el.dataset.v); if (i >= 0) e.splice(i, 1); else e.push(el.dataset.v); render(); },
+    obPreset(el) { UI.ob.P.equip = el.dataset.v === 'gym' ? EQUIP.map(e => e[0]) : el.dataset.v === 'home' ? ['bands', 'dumbbell'] : []; render(); },
+    obShuffle() { S.seedN++; UI.ob.plan = buildPlan(UI.ob.P, S.seedN); render(); },
+    obP12() { ACT.useP12(); },
+    useP12() { if (S.plan && S.plan.kind === 'custom') S.saved = S.plan; S.plan = normPlan({ kind: 'p12', week: 1 }); UI.ob = null; UI.tab = 'today'; UI.pick = null; commit(); clearRun(); render(); window.scrollTo(0, 0); },
+    useSaved() { if (!S.saved) return; S.plan = S.saved; S.saved = null; UI.pick = null; commit(); clearRun(); render(); },
+    setup() { closeSheet(); startSetup(false); window.scrollTo(0, 0); },
+    shuffle() { S.seedN++; S.plan = buildPlan(S.profile, S.seedN); S.plan.created = Date.now(); S.next = 0; UI.pick = null; commit(); clearRun(); render(); toast('New exercises picked.'); },
+    pick(el) { UI.pick = +el.dataset.i; render(); },
+    openW(el) { UI.pick = +el.dataset.i; UI.tab = 'today'; render(); window.scrollTo(0, 0); },
+    item(el) { openItem(el.dataset.b, +el.dataset.i); },
+    ex(el) { openExercise(el.dataset.id); },
+    sess(el) { openSession(+el.dataset.id); },
+    delSess(el) { S.log = S.log.filter(e => e.t !== +el.dataset.id); commit(); closeSheet(); render(); },
+    swap(el) { openSwap(el.dataset.b, +el.dataset.i, false); },
+    swapAll() { if (swapCtx) openSwap(swapCtx.block, swapCtx.i, !swapCtx.all); },
+    swapTo(el) { const c = swapCtx; if (!c) return; mutW(w => { w[c.block][c.i] = swapItem(w[c.block][c.i], el.dataset.id, profile()); }); closeSheet(); render(); toast('Swapped.'); },
+    sets(el) { const i = +el.dataset.i; mutW(w => { w.main[i].sets = clamp((w.main[i].sets || 1) + (+el.dataset.d), 1, 6); }); render(); openItem('main', i); },
+    remove(el) { const b = el.dataset.b, i = +el.dataset.i; mutW(w => { w[b].splice(i, 1); }); closeSheet(); render(); },
+    addTo(el) { const x = EX[el.dataset.id], w = S.plan.workouts[+el.dataset.i]; if (!x || !w) return; const b = x.s === 'stretch' ? (isWarm(x) ? 'warm' : 'cool') : 'main';
+      if (w[b].some(it => it.x === x.id)) { toast('Already in ' + w.name + '.'); return; }
+      const it = makeItem(x, profile(), false), o = { x: x.id, sets: b === 'main' ? it.sets : 1, rest: b === 'main' ? it.rest : undefined }; if (it.secs) o.secs = b === 'main' ? it.secs : [30, 30]; else o.reps = it.reps; if (b !== 'main') { delete o.rest; o.gap = 8; }
+      w[b].push(o); commit(); clearRun(); closeSheet(); toast('Added to ' + w.name + '.'); if (UI.tab !== 'library') render(); },
+    libArea(el) { UI.lib.area = el.dataset.v; UI.lib.n = 40; renderLibrary(); paintThumbs($('view')); },
+    libMine() { UI.lib.mine = !UI.lib.mine; UI.lib.n = 40; renderLibrary(); paintThumbs($('view')); },
+    libMore() { UI.lib.n += 40; libRefresh(); },
+    set(el) { const k = el.dataset.k; S.settings[k] = k === 'restAdj' ? +el.dataset.v : el.dataset.v; commit(); applyTheme(); if (k === 'sound' && el.dataset.v !== 'off') { Snd.unlock(); Snd.cue('up'); } render(); },
+    install() { if (!installEvt) return; installEvt.prompt(); installEvt.userChoice.then(() => { installEvt = null; render(); }).catch(() => { }); },
+    export() { const blob = new Blob([JSON.stringify(S)], { type: 'application/json' }), a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'guided-workouts-backup-' + new Date().toISOString().slice(0, 10) + '.json'; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 4000); toast('Backup file saved to your downloads.'); },
+    import() { $('fileIn').value = ''; $('fileIn').click(); },
+    erase() { if (!eraseArmed) { eraseArmed = 1; render(); setTimeout(() => { if (eraseArmed) { eraseArmed = 0; if (UI.tab === 'settings' && !UI.ob) render(); } }, 4000); return; } eraseArmed = 0; S = blank(); UI.ob = null; UI.tab = 'today'; UI.pick = null; commit(); clearRun(); applyTheme(); render(); },
+    phase(el) { const P = PHASES[+el.dataset.n - 1]; if (S.plan.week < P.from || S.plan.week > P.to) { S.plan.week = P.from; commit(); clearRun(); render(); } },
+    week(el) { S.plan.week = +el.dataset.w; commit(); clearRun(); render(); },
+    nextweek() { S.plan.week = Math.min(12, S.plan.week + 1); commit(); clearRun(); render(); },
+    p12var(el) { S.plan.pushVar = el.dataset.v; commit(); clearRun(); render(); },
+    p12core(el) { S.plan.core = el.dataset.v; commit(); clearRun(); render(); },
+    p12rest(el) { S.plan.rest = +el.dataset.n; commit(); clearRun(); render(); },
+    closeSheet,
+    start() { clearRun(); startSession(null); },
+    resume() { const r = readRun(); if (r) startSession(r); else render(); },
+    discard() { clearRun(); render(); },
+    toggle() { if (run.paused) resume(); else pause(); },
+    skip() { if (run.done) return; Snd.unlock(); if (run.paused) resume(); const st = cur(); advance(isGap(st) ? 'gap' : (st.kind === 'reps' && !run.manual ? run.t < cycleOf(st.tl) * 0.5 : run.t < 3) ? 'skip' : 'done'); },
+    back() { if (run.done) return; Snd.unlock(); if (run.paused) resume(); if (run.t > 3 || run.i === 0) { enterStep(null); return; } run.i--; enterStep(null); },
+    plus15() { const st = cur(); if (isGap(st)) { st.dur += 15; run.prevSec = -1; } },
+    logInc(el) { logAdjust(el.dataset.f, 1); }, logDec(el) { logAdjust(el.dataset.f, -1); },
+    logMark() { const st = cur(), ref = st.logRef; if (!ref) return; const rec = run.ex[ref.ei].sets[ref.si]; rec.d = 1; if (rec.w == null && isWeighted(EX[run.ex[ref.ei].x])) rec.w = defWeight(ref.ei, ref.si); saveRun(); paintLog(st); },
+    sound() { const order = Snd.canSpeak ? ['voice', 'beeps', 'off'] : ['beeps', 'off']; S.settings.sound = order[(order.indexOf(S.settings.sound) + 1) % order.length]; commit(); paintSound(); if (S.settings.sound === 'off') Snd.hush(); else { Snd.unlock(); Snd.cue('up'); } },
+    leave() { if (run.done) { ACT.doneBack(); return; } pause(); const any = run.ex.some(q => q.sets.some(s => s && s.d)); $('pLeaveSave').hidden = !any; $('pLeaveText').textContent = (storageOK ? 'Your place is kept for the next hour.' : 'Your place is kept while the app stays open.') + ' You can pick it up again from Today.'; $('pLeave').hidden = false; },
+    stay() { $('pLeave').hidden = true; resume(); },
+    leaveYes() { saveRun(); leaving = true; Nav.close(); },
+    leaveSave() { finish(true); },
+    doneBack() { leaving = true; Nav.close(); }
+  };
+  document.addEventListener('click', e => {
+    const el = e.target.closest('[data-act]');
+    if (el && ACT[el.dataset.act]) { if (el.disabled) return; ACT[el.dataset.act](el); return; }
+    if (e.target === $('sheet')) closeSheet();
+  });
+  document.addEventListener('input', e => {
+    if (e.target.id === 'libQ') { UI.lib.q = e.target.value; UI.lib.n = 40; libRefresh(); }
+    else if (e.target.id === 'pLogW' && run) { const st = cur(), ref = st.logRef; if (!ref) return; const rec = run.ex[ref.ei].sets[ref.si], v = parseFloat(e.target.value); rec.w = isFinite(v) && v >= 0 ? wStore(v) : null; saveRun(); }
+  });
+  $('fileIn').addEventListener('change', e => {
+    const f = e.target.files && e.target.files[0]; if (!f) return;
+    const rd = new FileReader();
+    rd.onload = () => { try { const d = JSON.parse(String(rd.result)); if (!d || d.v !== 1 || !Array.isArray(d.log)) throw 0; S = norm(d); UI.ob = null; UI.pick = null; commit(); clearRun(); applyTheme(); render(); toast('Backup restored.'); } catch (err) { toast('That file is not a Guided Workouts backup.'); } };
+    rd.readAsText(f);
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') { if (sheet.open) closeSheet(); else if (playing && !run.done && $('pLeave').hidden) ACT.leave(); return; }
+    if (!playing || run.done || !$('pLeave').hidden || e.target.closest('button,input')) return;
+    if (e.key === ' ') { e.preventDefault(); ACT.toggle(); } else if (e.key === 'ArrowRight') ACT.skip(); else if (e.key === 'ArrowLeft') ACT.back();
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) { if (playing && run && !run.paused && !run.done) pause(); }
+    else if (playing && run && !run.done) { run.last = performance.now(); wakeOn(); }
+  });
+
+  /* ---------- boot ---------- */
+  sheet.stage = new Stage($('sheetSvg')); pStage = new Stage($('pSvg'));
+  applyTheme(); render();
+  (function frame(now) {
+    requestAnimationFrame(frame);
+    if (document.hidden) return;
+    now = now || performance.now();
+    if (playing && run) { if (!run.done) playerTick(now); }
+    else if (sheet.open) sheetDraw(now);
+    else if (UI.ob && OB_STEPS[UI.ob.step] === 'welcome' && obStage && $('obSvg') && !reduceMotion) { const k = Math.floor(now / 6000) % OB_DEMO.length, x = EX[OB_DEMO[k]]; drawDemo(obStage, animOf(x), timelineOf(x), (now % 6000) / 1000, loopOf(x)); }
+    else if (UI.tab === 'today' && !UI.ob) heroDraw(now);
+  })(performance.now());
+  cloudInit();
+  if ('serviceWorker' in navigator && location.protocol.indexOf('http') === 0 && !window.claude) {
+    navigator.serviceWorker.register('./sw.js').catch(() => { });
+    let had = !!navigator.serviceWorker.controller;
+    navigator.serviceWorker.addEventListener('controllerchange', () => { if (had && !playing) location.reload(); had = true; });
+  }
+  window.__gw = { get S() { return S; }, get run() { return run; }, ACT, UI, render };
+})();

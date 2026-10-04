@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#C23A24">
+<meta name="description" content="Personal workout plans with animated demonstrations, timing and a log of every set.">
+<title>Guided Workouts</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<noscript><p class="nojs">This app needs JavaScript to run. Open it in a web browser such as Chrome, Safari, Edge or Firefox.</p></noscript>
+
+<div id="app" class="app">
+  <main id="view" class="wrap" tabindex="-1"></main>
+  <nav class="tabs" id="tabs" aria-label="Sections" hidden>
+    <button type="button" data-act="tab" data-tab="today"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg><span>Today</span></button>
+    <button type="button" data-act="tab" data-tab="plan"><svg viewBox="0 0 24 24"><path d="M5 6h14M5 12h14M5 18h9"/></svg><span>Plan</span></button>
+    <button type="button" data-act="tab" data-tab="history"><svg viewBox="0 0 24 24"><path d="M5 19V10M12 19V5M19 19v-7"/></svg><span>History</span></button>
+    <button type="button" data-act="tab" data-tab="library"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M16 16l4 4"/></svg><span>Library</span></button>
+    <button type="button" data-act="tab" data-tab="settings"><svg viewBox="0 0 24 24"><path d="M5 8h9M18 8h1M5 16h1M10 16h9"/><circle cx="16" cy="8" r="2"/><circle cx="8" cy="16" r="2"/></svg><span>Settings</span></button>
+  </nav>
+</div>
+
+<div class="sheet" id="sheet" hidden>
+  <div class="sheet-card" role="dialog" aria-modal="true" aria-labelledby="sheetTitle">
+    <div class="sheet-head">
+      <div><h2 id="sheetTitle"></h2><p class="doc" id="sheetDoc"></p></div>
+      <button type="button" class="iconbtn" data-act="closeSheet" aria-label="Close"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+    </div>
+    <div class="stagebox" id="sheetStageBox"><svg id="sheetSvg" aria-hidden="true"></svg><span class="stage-cap" id="sheetCap"></span></div>
+    <div id="sheetBody"></div>
+  </div>
+</div>
+
+<div class="player" id="player" hidden data-mode="ready">
+  <div class="p-top">
+    <button type="button" class="iconbtn" data-act="leave" aria-label="Leave workout"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+    <div>
+      <div class="p-blocks" id="pBlocks"><span data-b="warm"><i></i></span><span data-b="main"><i></i></span><span data-b="cool"><i></i></span></div>
+      <div class="p-meta"><span id="pBlock">Warm-up</span><span id="pStepNo"></span></div>
+    </div>
+    <div class="p-left"><span id="pLeft">0:00</span><small>left</small></div>
+  </div>
+
+  <div class="p-main">
+    <div class="p-stage"><svg id="pSvg" aria-hidden="true"></svg><span class="p-tag" id="pTag">Get ready</span><span class="p-approx" id="pApprox" hidden>Similar movement shown</span></div>
+    <div class="p-info">
+      <p class="p-kicker" id="pKicker"></p>
+      <h2 class="p-title" id="pTitle"></h2>
+      <div class="p-read"><span class="p-big" id="pBig">0</span><span class="p-of" id="pOf"></span></div>
+      <div class="p-phase"><b id="pPhase"></b><span><i id="pPhaseFill"></i></span></div>
+      <p class="p-cue" id="pCue"></p>
+      <div class="p-log" id="pLog" hidden>
+        <p class="p-loglab" id="pLogLab"></p>
+        <div class="p-logrow">
+          <div class="num" id="pNumA"><button type="button" data-act="logDec" data-f="v" aria-label="Fewer">−</button><output id="pLogVal">10</output><button type="button" data-act="logInc" data-f="v" aria-label="More">+</button><small id="pLogUnit">reps</small></div>
+          <div class="num" id="pNumW"><button type="button" data-act="logDec" data-f="w" aria-label="Lighter">−</button><input id="pLogW" type="number" inputmode="decimal" min="0" step="0.5" aria-label="Weight"><button type="button" data-act="logInc" data-f="w" aria-label="Heavier">+</button><small id="pLogWUnit">kg</small></div>
+          <button type="button" class="btn" id="pLogMark" data-act="logMark" hidden>Mark as done</button>
+        </div>
+      </div>
+      <div class="p-next" id="pNext" hidden>
+        <button type="button" class="btn" data-act="plus15">+15 sec</button>
+        <span class="p-hint" id="pHint"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="p-bottom">
+    <div class="p-ctrl">
+      <button type="button" data-act="back" aria-label="Back one step"><svg viewBox="0 0 24 24"><path d="M19 5v14l-10-7zM5 5h2.5v14H5z"/></svg>Back</button>
+      <button type="button" class="go" data-act="toggle" id="pToggle"><svg viewBox="0 0 24 24" id="pToggleIcon"><path d="M7 5h3.5v14H7zM13.5 5H17v14h-3.5z"/></svg><span id="pToggleText">Pause</span></button>
+      <button type="button" data-act="skip" id="pSkip" aria-label="Next step"><span id="pSkipText">Skip</span><svg viewBox="0 0 24 24"><path d="M5 5v14l10-7zM16.5 5H19v14h-2.5z"/></svg></button>
+    </div>
+    <div class="p-aux">
+      <button type="button" class="btn" data-act="sound" id="pSound">Voice + beeps</button>
+      <span class="p-note" id="pNote"></span>
+    </div>
+  </div>
+
+  <div class="p-over" id="pLeave" hidden>
+    <p class="eyebrow">Workout paused</p>
+    <h2>Leave now?</h2>
+    <p id="pLeaveText"></p>
+    <div class="row">
+      <button type="button" class="btn solid" data-act="stay">Keep going</button>
+      <button type="button" class="btn" data-act="leaveSave" id="pLeaveSave">Finish and save what I did</button>
+      <button type="button" class="btn" data-act="leaveYes">Leave for now</button>
+    </div>
+  </div>
+
+  <div class="p-over" id="pDone" hidden>
+    <p class="eyebrow" id="doneEyebrow"></p>
+    <h2>Workout done</h2>
+    <div class="stats" id="doneStats"></div>
+    <ul class="donelist" id="doneList"></ul>
+    <ul class="plain" id="doneNotes"></ul>
+    <div class="row"><button type="button" class="btn solid" data-act="doneBack">Finish</button></div>
+  </div>
+</div>
+
+<div class="toast" id="toast" role="status" hidden></div>
+<input type="file" id="fileIn" accept="application/json,.json" hidden>
+
+<script src="app.js"></script>
+</body>
+</html>
